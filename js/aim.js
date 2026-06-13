@@ -15,7 +15,7 @@ function simulateShot(balls, bounds, cueVel, maxSteps) {
 
   // Clone the active balls (order preserved, cue ball stays index 0).
   const sim = balls.filter((b) => b.active).map((b) => new Ball(b.pos.x, b.pos.y, b.number));
-  if (sim.length === 0) return [];
+  if (sim.length === 0) return { trails: [], firstContact: null };
   sim[0].vel = { x: cueVel.x, y: cueVel.y };
 
   const trails = sim.map((b) => ({
@@ -27,9 +27,22 @@ function simulateShot(balls, bounds, cueVel, maxSteps) {
   }));
 
   const pockets = pocketCenters();
+  let firstContact = null; // { x, y, ball } — where the cue first strikes a ball
 
   for (let s = 0; s < maxSteps && !allStopped(sim); s++) {
     stepPhysics(sim, bounds);
+
+    // The first object ball to gain velocity marks the cue's first contact;
+    // the cue's position at that moment is the ghost-ball point.
+    if (!firstContact) {
+      for (let i = 1; i < sim.length; i++) {
+        const b = sim[i];
+        if (b.active && (b.vel.x !== 0 || b.vel.y !== 0)) {
+          firstContact = { x: sim[0].pos.x, y: sim[0].pos.y, ball: b.number };
+          break;
+        }
+      }
+    }
 
     for (let i = 0; i < sim.length; i++) {
       const b = sim[i];
@@ -69,5 +82,5 @@ function simulateShot(balls, bounds, cueVel, maxSteps) {
     }
   }
 
-  return trails;
+  return { trails, firstContact };
 }

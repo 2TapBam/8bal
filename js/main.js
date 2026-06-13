@@ -1,17 +1,19 @@
 "use strict";
 
 // ---------------------------------------------------------------------------
-// main.js — rendering, input, and the game loop.
+// main.js — rendering, input, game loop, and the "future" analysis.
 //
-// Controls (8-ball-pool style):
-//   - Aim:   drag anywhere on the felt to point the line.
-//   - Power: drag the slider on the LEFT rail; release to shoot.
-//   - Fine:  drag the dial on the RIGHT rail for tiny aim adjustments.
-//   - Space shoots at the current power; R re-racks.
+// Controls: drag the felt to aim · drag the left slider (release) or Space to
+// shoot · drag the right dial for fine aim · R to re-rack.
 //
-// The aim guide is a full-shot preview: it simulates the entire shot and draws
-// where the cue ball stops and where every ball it hits stops.
-// Still a self-contained sandbox; nothing connects to any external game.
+// Two views:
+//   Play   — one clean predicted shot (cue path, ghost contact, target path,
+//            target pocket) plus translucent ghost balls at predicted rests.
+//   Assist — the full solver: every ball's path, stop markers, all badges.
+//
+// A "future" panel estimates pot / scratch / next-shot chances by simulating
+// the aimed shot many times with small aim & power jitter (Monte-Carlo).
+// Fully self-contained; nothing connects to any external game.
 // ---------------------------------------------------------------------------
 
 const canvas = document.getElementById("table");
@@ -21,22 +23,23 @@ const bounds = playfield();
 const W = TABLE.width;
 const H = TABLE.height;
 
-// Crisp rendering on high-DPI screens.
 const dpr = Math.max(1, Math.min(3, Math.floor(window.devicePixelRatio || 1)));
 canvas.width = W * dpr;
 canvas.height = H * dpr;
 ctx.scale(dpr, dpr);
 
-const MAX_SPEED = 19;        // cue-ball speed at full power
-const FINE_SENSITIVITY = 0.0015; // radians of aim change per pixel of dial drag
+const MAX_SPEED = 19;
+const FINE_SENSITIVITY = 0.0015;
 
 const ui = {
-  showGuides: document.getElementById("showGuides"),
-  showStops: document.getElementById("showStops"),
+  mode: document.getElementById("mode"), // 'play' | 'assist'
   reset: document.getElementById("reset"),
 };
+const isAssist = () => ui.mode && ui.mode.value === "assist";
+
 const statusEl = document.getElementById("status");
 const shotListEl = document.getElementById("shotList");
+const shotStatsEl = document.getElementById("shotStats");
 const shotTipsEl = document.getElementById("shotTips");
 const POCKET_NAMES = ["top-left", "top-middle", "top-right", "bottom-left", "bottom-middle", "bottom-right"];
 const advisor = { list: [] };
@@ -45,24 +48,17 @@ let balls = [];
 let wasMoving = false;
 
 const state = {
-  aimAngle: 0,     // radians; 0 points toward the rack
-  power: 0.55,     // 0..1
-  drag: null,      // 'aim' | 'power' | 'fine'
+  aimAngle: 0,
+  power: 0.55,
+  drag: null,        // 'aim' | 'power' | 'fine'
   fineLastY: 0,
   predDirty: true,
-  pred: null,
+  pred: null,        // { trails, firstContact }
+  outcomes: null,    // { pot, scratch, next, win, lose }
 };
 
-// 8-ball rules state. `group` is claimed on the first clean pot; `shotPots`
-// collects the balls sunk during the shot in progress.
-const game = {
-  group: null,     // null (open) | 'solids' | 'stripes'
-  shotPots: [],
-  won: false,
-  lost: false,
-};
+const game = { group: null, shotPots: [], won: false, lost: false };
 
-// Authentic-ish 8-ball colours: 1-7 solids, 8 black, 9-15 stripes, 0 = cue.
 const BALL_COLORS = {
   0: "#f6f4ee",
   1: "#f3c43d", 2: "#1f59c4", 3: "#d33b30", 4: "#7b2d96",
@@ -77,14 +73,7 @@ function hexRgb(hex) {
   return `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`;
 }
 
-// A standard-looking rack: apex toward the cue ball, 8 in the centre.
-const RACK = [
-  [1],
-  [2, 9],
-  [10, 8, 3],
-  [4, 14, 11, 5],
-  [6, 15, 13, 7, 12],
-];
+const RACK = [[1], [2, 9], [10, 8, 3], [4, 14, 11, 5], [6, 15, 13, 7, 12]];
 
 function rack() {
   const r = TABLE.ballRadius;
@@ -94,9 +83,7 @@ function rack() {
   const rowDx = 2 * r * Math.cos(Math.PI / 6) + 0.6;
   RACK.forEach((column, col) => {
     column.forEach((number, i) => {
-      const x = apexX + col * rowDx;
-      const y = apexY + (i - col / 2) * (2 * r + 0.6);
-      list.push(new Ball(x, y, number));
+      list.push(new Ball(apexX + col * rowDx, apexY + (i - col / 2) * (2 * r + 0.6), number));
     });
   });
   return list;
@@ -107,68 +94,50 @@ function pocketBalls() {
     if (!b.active) continue;
     for (const p of pocketCenters()) {
       if (Vec.len(Vec.sub(b.pos, p)) < TABLE.pocketRadius) {
-        if (b.number === 0) {
-          b.pos = { x: W * 0.26, y: H / 2 };
-          b.vel = { x: 0, y: 0 };
-        } else {
-          b.active = false;
-          game.shotPots.push(b.number);
-        }
+        if (b.number === 0) { b.pos = { x: W * 0.26, y: H / 2 }; b.vel = { x: 0, y: 0 }; }
+        else { b.active = false; game.shotPots.push(b.number); }
         break;
       }
     }
   }
 }
 
-// How many of a group's balls are still on the table.
+// --- 8-ball rules ----------------------------------------------------------
+
 function remainingInGroup(group) {
   const lo = group === "solids" ? 1 : 9;
   const hi = group === "solids" ? 7 : 15;
   return balls.filter((b) => b.active && b.number >= lo && b.number <= hi).length;
 }
 
-// Apply 8-ball rules once the table settles after a shot.
 function evaluateShot() {
   const pots = game.shotPots;
   const solids = pots.filter((n) => n >= 1 && n <= 7).length;
   const stripes = pots.filter((n) => n >= 9 && n <= 15).length;
   const eight = pots.includes(8);
-
-  // Claim a group on the first clean pot (mixed pots leave the table open).
   if (!game.group && !game.won && !game.lost) {
     if (solids && !stripes) game.group = "solids";
     else if (stripes && !solids) game.group = "stripes";
   }
-
-  // The 8-ball decides the game: legal only after your group is cleared.
   if (eight && !game.won && !game.lost) {
     if (game.group && remainingInGroup(game.group) === 0) game.won = true;
     else game.lost = true;
   }
-
   updateStatus();
 }
 
 function updateStatus() {
-  let text, statusState;
-  if (game.won) {
-    text = "You sank the 8-ball — you win! Press R to rack again.";
-    statusState = "win";
-  } else if (game.lost) {
-    text = "The 8-ball went down too early — game over. Press R to rack again.";
-    statusState = "lose";
-  } else if (!game.group) {
-    text = "Open table — pot a solid (1–7) or stripe (9–15) to claim your group.";
-    statusState = "open";
-  } else {
+  let html, statusState;
+  if (game.won) { html = "<b>You win!</b> &middot; 8-ball down &middot; press R to rack again"; statusState = "win"; }
+  else if (game.lost) { html = "<b>Game over</b> &middot; 8-ball potted too early &middot; press R to rack again"; statusState = "lose"; }
+  else if (!game.group) { html = "<b>Open table</b> &middot; pot any ball to choose your group"; statusState = "open"; }
+  else {
     const left = remainingInGroup(game.group);
-    const name = game.group === "solids" ? "Solids (1–7)" : "Stripes (9–15)";
-    text = left > 0
-      ? `You're ${name} — ${left} ball${left === 1 ? "" : "s"} left, then the 8.`
-      : `You're ${name} — group cleared! Pot the 8-ball to win.`;
+    const name = game.group === "solids" ? "Solids" : "Stripes";
+    html = left > 0 ? `<b>${name}:</b> ${left} left &rarr; then 8-ball` : `<b>${name} cleared</b> &rarr; pot the 8-ball to win`;
     statusState = game.group;
   }
-  statusEl.textContent = text;
+  statusEl.innerHTML = html;
   statusEl.dataset.state = statusState;
 }
 
@@ -179,29 +148,22 @@ function newRack() {
   game.won = false;
   game.lost = false;
   state.predDirty = true;
+  state.outcomes = null;
   updateStatus();
   scheduleAdvisor();
 }
 
-// --- shot advisor ----------------------------------------------------------
+// --- legality helpers ------------------------------------------------------
 
-function legalTargets() {
-  if (game.won || game.lost) return [];
-  let nums;
-  if (!game.group) nums = [1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15];
-  else if (remainingInGroup(game.group) > 0)
-    nums = game.group === "solids" ? [1, 2, 3, 4, 5, 6, 7] : [9, 10, 11, 12, 13, 14, 15];
-  else nums = [8];
-  return balls.filter((b) => b.active && nums.includes(b.number));
-}
-
-function isLegalNumber(n) {
-  if (game.won || game.lost) return false;
-  if (!game.group) return n >= 1 && n <= 15 && n !== 8;
+function legalNumberSet() {
+  if (game.won || game.lost) return new Set();
+  if (!game.group) return new Set([1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15]);
   if (remainingInGroup(game.group) > 0)
-    return game.group === "solids" ? n >= 1 && n <= 7 : n >= 9 && n <= 15;
-  return n === 8;
+    return new Set(game.group === "solids" ? [1, 2, 3, 4, 5, 6, 7] : [9, 10, 11, 12, 13, 14, 15]);
+  return new Set([8]);
 }
+function isLegalNumber(n) { return legalNumberSet().has(n); }
+function legalTargets() { const s = legalNumberSet(); return balls.filter((b) => b.active && s.has(b.number)); }
 
 function angDiff(a, b) {
   let d = a - b;
@@ -210,13 +172,14 @@ function angDiff(a, b) {
   return d;
 }
 
-// Is the straight corridor from `from` to `to` blocked by another ball?
-function pathBlocked(from, to, ignore) {
+// --- geometry: blocked paths and clear-pot tests ---------------------------
+
+function pathBlockedIn(list, from, to, ignore) {
   const seg = Vec.sub(to, from);
   const segLen = Vec.len(seg);
   if (segLen < 1e-6) return false;
   const dir = Vec.scale(seg, 1 / segLen);
-  for (const b of balls) {
+  for (const b of list) {
     if (!b.active || ignore.includes(b.number)) continue;
     const t = Vec.dot(Vec.sub(b.pos, from), dir);
     if (t < -TABLE.ballRadius || t > segLen + TABLE.ballRadius) continue;
@@ -226,9 +189,36 @@ function pathBlocked(from, to, ignore) {
   }
   return false;
 }
+function pathBlocked(from, to, ignore) { return pathBlockedIn(balls, from, to, ignore); }
 
-// Geometry of potting `target` into pocket `pi`: aim, cut angle and distance,
-// or null if the cut is impossible or the path is blocked.
+// Does `cuePos` have a clean pot on `target` into pocket `pi`, given `list`?
+function clearGeometry(cuePos, target, pi, list) {
+  const P = pocketCenters()[pi];
+  const T = target.pos;
+  const dirTP = Vec.norm(Vec.sub(P, T));
+  const ghost = Vec.sub(T, Vec.scale(dirTP, 2 * TABLE.ballRadius));
+  const toGhost = Vec.sub(ghost, cuePos);
+  if (Vec.len(toGhost) < 1) return false;
+  if (Vec.dot(Vec.norm(toGhost), dirTP) < 0.3) return false; // too thin to count as "clear"
+  if (pathBlockedIn(list, cuePos, ghost, [0, target.number])) return false;
+  if (pathBlockedIn(list, T, P, [0, target.number])) return false;
+  return true;
+}
+
+// Is there any legal clear pot on a resting table?
+function hasClearPot(list) {
+  const cue = list.find((b) => b.number === 0);
+  if (!cue) return false;
+  const legal = legalNumberSet();
+  for (const b of list) {
+    if (b.number === 0 || !legal.has(b.number)) continue;
+    for (let pi = 0; pi < 6; pi++) if (clearGeometry(cue.pos, b, pi, list)) return true;
+  }
+  return false;
+}
+
+// --- shot advisor (ranked options) -----------------------------------------
+
 function evaluateCandidate(target, pi) {
   const cue = balls[0];
   const P = pocketCenters()[pi];
@@ -240,7 +230,7 @@ function evaluateCandidate(target, pi) {
   if (distCue < 1) return null;
   const aimDir = Vec.scale(toGhost, 1 / distCue);
   const dot = Vec.dot(aimDir, dirTP);
-  if (dot < 0.21) return null; // cut thinner than ~78 degrees is unrealistic
+  if (dot < 0.21) return null;
   if (pathBlocked(cue.pos, ghost, [0, target.number])) return null;
   if (pathBlocked(T, P, [0, target.number])) return null;
   return {
@@ -252,15 +242,13 @@ function evaluateCandidate(target, pi) {
   };
 }
 
-// Confirm a candidate by simulating it; keep the lowest-difficulty power that
-// actually drops the ball into the intended pocket.
 function validateAndScore(c) {
   const diag = Math.hypot(W, H);
   let best = null;
   for (const p of [0.5, 0.8]) {
     const speed = p * MAX_SPEED;
     const vel = { x: Math.cos(c.aimAngle) * speed, y: Math.sin(c.aimAngle) * speed };
-    const trails = simulateShot(balls, bounds, vel, 700);
+    const { trails } = simulateShot(balls, bounds, vel, 700);
     const tt = trails.find((t) => t.number === c.number);
     const cueT = trails.find((t) => t.number === 0);
     const intoPocket = tt && tt.pocketed &&
@@ -280,10 +268,7 @@ function computeRecommendations() {
   const out = [];
   for (const t of legalTargets()) {
     const cands = [];
-    for (let pi = 0; pi < 6; pi++) {
-      const c = evaluateCandidate(t, pi);
-      if (c) cands.push(c);
-    }
+    for (let pi = 0; pi < 6; pi++) { const c = evaluateCandidate(t, pi); if (c) cands.push(c); }
     cands.sort((a, b) => (a.cutDeg + a.dist * 0.05) - (b.cutDeg + b.dist * 0.05));
     let bestForBall = null;
     for (const c of cands.slice(0, 2)) {
@@ -296,48 +281,107 @@ function computeRecommendations() {
   advisor.list = out.slice(0, 5);
   renderShotList();
 }
+function scheduleAdvisor() { setTimeout(computeRecommendations, 0); }
 
-// Run the (heavier) analysis off the critical path so the frame still paints.
-function scheduleAdvisor() {
-  setTimeout(computeRecommendations, 0);
+function difficultyLabel(s) { return s.quality >= 72 ? "Easy" : s.quality >= 48 ? "Medium" : "Hard"; }
+function reasonFor(s) {
+  const cut = s.cutDeg < 8 ? "straight pot" : s.cutDeg < 25 ? "gentle cut" : s.cutDeg < 45 ? "moderate cut" : "thin cut";
+  const range = s.dist > Math.hypot(W, H) * 0.6 ? "long range" : "short range";
+  const cue = s.scratch ? "cue may scratch — use soft pace" : "clear path, safe cue position";
+  return `${cut}, ${range}; ${cue}`;
 }
 
 function renderShotList() {
   if (!shotListEl) return;
-  if (game.won || game.lost) { shotListEl.innerHTML = "<li>Game over &mdash; press R to rack again.</li>"; return; }
-  if (!advisor.list.length) { shotListEl.innerHTML = "<li>No clear pot &mdash; play safe or break up a cluster.</li>"; return; }
-  shotListEl.innerHTML = advisor.list.map((s) => {
-    const diff = s.cutDeg < 8 ? "straight in" : s.cutDeg < 25 ? "easy cut" : s.cutDeg < 45 ? "moderate cut" : "thin cut";
-    const warn = s.scratch ? " &middot; scratch risk" : "";
-    return `<li><b>${s.number}-ball</b> &rarr; ${POCKET_NAMES[s.pocketIndex]} <span class="meta">${diff}${warn} &middot; ${s.quality}%</span></li>`;
-  }).join("");
+  if (game.won || game.lost) { shotListEl.innerHTML = `<p class="muted">Game over — press R to rack again.</p>`; return; }
+  if (!advisor.list.length) { shotListEl.innerHTML = `<p class="muted">No clear pot — play safe or break up a cluster.</p>`; return; }
+  const best = advisor.list[0];
+  let html = `<div class="best">
+      <div class="best-line"><span class="rankdot">1</span> <b>${best.number}-ball</b> &rarr; ${POCKET_NAMES[best.pocketIndex]}</div>
+      <div class="best-meta"><span>Difficulty: <b>${difficultyLabel(best)}</b></span><span>Success: <b>${best.quality}%</b></span></div>
+      <div class="best-reason">${reasonFor(best)}</div>
+    </div>`;
+  if (advisor.list.length > 1) {
+    html += `<ol class="rank" start="2">` + advisor.list.slice(1).map((s) =>
+      `<li>${s.number}-ball &rarr; ${POCKET_NAMES[s.pocketIndex]} <span class="meta">${difficultyLabel(s)} &middot; ${s.quality}%</span></li>`
+    ).join("") + `</ol>`;
+  }
+  shotListEl.innerHTML = html;
 }
+
+// --- "future" outcomes: Monte-Carlo over jittered aim & power ---------------
+
+function buildRestTable(trails) {
+  return trails.filter((t) => !t.pocketed).map((t) => ({ pos: { x: t.rest.x, y: t.rest.y }, number: t.number, active: true }));
+}
+
+function predictOutcomes(aimAngle, power, samples) {
+  samples = samples || 28;
+  let pot = 0, scratch = 0, next = 0, win = 0, lose = 0;
+  for (let s = 0; s < samples; s++) {
+    const a = aimAngle + (Math.random() - 0.5) * 0.016;            // ~±0.5 deg of aim wobble
+    const p = Math.max(0.05, power + (Math.random() - 0.5) * 0.06);
+    const speed = p * MAX_SPEED;
+    const { trails } = simulateShot(balls, bounds, { x: Math.cos(a) * speed, y: Math.sin(a) * speed }, 900);
+    const cueT = trails.find((t) => t.number === 0);
+    const cueScratched = !!(cueT && cueT.pocketed);
+    const pottedLegal = trails.some((t) => t.pocketed && t.number !== 0 && isLegalNumber(t.number));
+    const potted8 = trails.some((t) => t.pocketed && t.number === 8);
+    if (cueScratched) scratch++;
+    if (pottedLegal && !cueScratched) pot++;
+    if (potted8) { if (isLegalNumber(8) && !cueScratched) win++; else lose++; }
+    if (!cueScratched && !potted8 && hasClearPot(buildRestTable(trails))) next++;
+  }
+  const pct = (n) => Math.round((n / samples) * 100);
+  return { pot: pct(pot), scratch: pct(scratch), next: pct(next), win: pct(win), lose: pct(lose) };
+}
+
+let outcomesTimer = null;
+function scheduleOutcomes() {
+  if (outcomesTimer) clearTimeout(outcomesTimer);
+  outcomesTimer = setTimeout(() => {
+    if (!allStopped(balls) || game.won || game.lost) { state.outcomes = null; renderOutcomes(null); return; }
+    state.outcomes = predictOutcomes(state.aimAngle, state.power);
+    renderOutcomes(state.outcomes);
+  }, 140);
+}
+
+function renderOutcomes(o) {
+  if (!shotStatsEl) return;
+  if (!o) { shotStatsEl.innerHTML = `<p class="muted">Aim a shot to forecast its future.</p>`; return; }
+  const bar = (label, val, cls) =>
+    `<div class="stat ${cls}"><span class="stat-l">${label}</span>
+       <span class="stat-bar"><i style="width:${val}%"></i></span>
+       <b class="stat-v">${val}%</b></div>`;
+  let html = bar("Pot", o.pot, "good") + bar("Scratch", o.scratch, "bad") + bar("Next shot", o.next, "neutral");
+  if (o.win) html += bar("Win (8-ball)", o.win, "good");
+  if (o.lose) html += bar("Lose (early 8)", o.lose, "bad");
+  shotStatsEl.innerHTML = html;
+}
+
+// --- current-shot explanation ("why") --------------------------------------
 
 function renderTips(tips) {
   if (!shotTipsEl) return;
-  shotTipsEl.innerHTML = tips.length
-    ? tips.map((t) => `<li>${t}</li>`).join("")
-    : "<li>Aim to see feedback on your shot.</li>";
+  shotTipsEl.innerHTML = tips.length ? tips.map((t) => `<li>${t}</li>`).join("") : "<li>Aim to see feedback on your shot.</li>";
 }
 
-// Feedback on the line the player is currently aiming, read from the cached
-// full-shot prediction plus the ranked recommendations.
 function currentShotTips() {
   if (!shotTipsEl) return;
   if (game.won || game.lost) { renderTips(["Game over — press R to rack again."]); return; }
-  const pred = state.pred;
-  if (!pred) { renderTips([]); return; }
+  const trails = state.pred && state.pred.trails;
+  if (!trails) { renderTips([]); return; }
 
   const tips = [];
-  const cueT = pred.find((t) => t.number === 0);
+  const cueT = trails.find((t) => t.number === 0);
   const scratch = !!(cueT && cueT.pocketed);
-  const potted = pred.filter((t) => t.pocketed && t.number !== 0);
+  const potted = trails.filter((t) => t.pocketed && t.number !== 0);
   const good = potted.filter((t) => isLegalNumber(t.number)).map((t) => t.number);
   const bad8 = potted.some((t) => t.number === 8) && !isLegalNumber(8);
 
   if (scratch) tips.push("This line scratches the cue ball — lower the power or change the angle.");
   if (bad8) tips.push("This pots the 8-ball early, which loses the game.");
-  if (good.length) tips.push(`Good — this pots the ${good.join(", ")}.`);
+  if (good.length) tips.push(`This pots the ${good.join(", ")}.`);
 
   if (advisor.list.length) {
     let nearest = null, nd = Infinity;
@@ -347,7 +391,7 @@ function currentShotTips() {
     }
     const degs = nearest.d * 180 / Math.PI;
     if (Math.abs(degs) > 1.2) {
-      tips.push(`Rotate about ${Math.abs(degs).toFixed(1)}° ${degs > 0 ? "clockwise" : "counter-clockwise"} to line up the ${nearest.s.number}-ball (${POCKET_NAMES[nearest.s.pocketIndex]}).`);
+      tips.push(`Rotate about ${Math.abs(degs).toFixed(1)}° ${degs > 0 ? "clockwise" : "counter-clockwise"} for the ${nearest.s.number}-ball (${POCKET_NAMES[nearest.s.pocketIndex]}).`);
     } else {
       if (!good.length && !scratch) tips.push(`Lined up on the ${nearest.s.number}-ball — fine-tune with the right dial.`);
       const pd = state.power - nearest.s.power;
@@ -355,52 +399,19 @@ function currentShotTips() {
       else if (pd < -0.12) tips.push("Add a touch more power so it reaches.");
     }
   }
-
   if (!tips.length) tips.push("No legal pot on this line — try a different angle.");
   renderTips(tips.slice(0, 3));
-}
-
-function drawAdvisorBadges() {
-  advisor.list.forEach((s, i) => {
-    const b = balls.find((x) => x.active && x.number === s.number);
-    if (!b) return;
-    const bx = b.pos.x;
-    const by = b.pos.y - TABLE.ballRadius - 9;
-    ctx.beginPath();
-    ctx.arc(bx, by, 8, 0, Math.PI * 2);
-    ctx.fillStyle = i === 0 ? "rgba(243,196,61,0.95)" : "rgba(16,24,30,0.9)";
-    ctx.fill();
-    ctx.lineWidth = 1.5;
-    ctx.strokeStyle = "rgba(255,255,255,0.85)";
-    ctx.stroke();
-    ctx.fillStyle = i === 0 ? "#1a1a1a" : "#fff";
-    ctx.font = "bold 10px system-ui, sans-serif";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(String(i + 1), bx, by + 0.5);
-  });
 }
 
 // --- control geometry ------------------------------------------------------
 
 const POWER = { x: 16, w: 14 };
-function powerRect() {
-  return { x: POWER.x, w: POWER.w, y0: bounds.top + 12, y1: bounds.bottom - 12 };
-}
-function inPower(p) {
-  const r = powerRect();
-  return p.x >= r.x - 8 && p.x <= r.x + r.w + 8 && p.y >= r.y0 - 10 && p.y <= r.y1 + 10;
-}
-function fineDial() {
-  const cx = W - TABLE.margin / 2;
-  return { cx, cy: H / 2, y0: bounds.top + 12, y1: bounds.bottom - 12 };
-}
-function inFine(p) {
-  const d = fineDial();
-  return Math.abs(p.x - d.cx) < 16 && p.y >= d.y0 - 10 && p.y <= d.y1 + 10;
-}
+function powerRect() { return { x: POWER.x, w: POWER.w, y0: bounds.top + 12, y1: bounds.bottom - 12 }; }
+function inPower(p) { const r = powerRect(); return p.x >= r.x - 8 && p.x <= r.x + r.w + 8 && p.y >= r.y0 - 10 && p.y <= r.y1 + 10; }
+function fineDial() { const cx = W - TABLE.margin / 2; return { cx, cy: H / 2, y0: bounds.top + 12, y1: bounds.bottom - 12 }; }
+function inFine(p) { const d = fineDial(); return Math.abs(p.x - d.cx) < 16 && p.y >= d.y0 - 10 && p.y <= d.y1 + 10; }
 
-// --- table & balls ---------------------------------------------------------
+// --- table -----------------------------------------------------------------
 
 function roundRect(x, y, w, h, r) {
   ctx.beginPath();
@@ -422,113 +433,126 @@ function diamond(x, y) {
 }
 
 function drawDiamonds() {
-  const b = bounds;
-  const m = TABLE.margin / 2;
-  const w = b.right - b.left;
-  const h = b.bottom - b.top;
-  for (let i = 1; i <= 7; i++) {
-    if (i === 4) continue;
-    const x = b.left + (w * i) / 8;
-    diamond(x, m);
-    diamond(x, H - m);
-  }
-  for (let i = 1; i <= 3; i++) {
-    const y = b.top + (h * i) / 4;
-    diamond(m, y);
-    diamond(W - m, y);
+  const b = bounds, m = TABLE.margin / 2;
+  const w = b.right - b.left, h = b.bottom - b.top;
+  for (let i = 1; i <= 7; i++) { if (i === 4) continue; const x = b.left + (w * i) / 8; diamond(x, m); diamond(x, H - m); }
+  for (let i = 1; i <= 3; i++) { const y = b.top + (h * i) / 4; diamond(m, y); diamond(W - m, y); }
+}
+
+function drawPockets() {
+  const rr = TABLE.pocketMouth; // visible opening (capture radius is larger)
+  for (const p of pocketCenters()) {
+    const jaw = ctx.createRadialGradient(p.x, p.y, rr * 0.4, p.x, p.y, rr + 7);
+    jaw.addColorStop(0, "rgba(3,16,10,0.95)");
+    jaw.addColorStop(0.7, "rgba(5,20,13,0.5)");
+    jaw.addColorStop(1, "rgba(5,20,13,0)");
+    ctx.beginPath(); ctx.arc(p.x, p.y, rr + 7, 0, Math.PI * 2); ctx.fillStyle = jaw; ctx.fill();
+
+    const mouth = ctx.createRadialGradient(p.x - rr * 0.3, p.y - rr * 0.3, 1, p.x, p.y, rr);
+    mouth.addColorStop(0, "#232824");
+    mouth.addColorStop(0.6, "#0c110d");
+    mouth.addColorStop(1, "#020604");
+    ctx.beginPath(); ctx.arc(p.x, p.y, rr, 0, Math.PI * 2); ctx.fillStyle = mouth; ctx.fill();
+
+    ctx.beginPath(); ctx.arc(p.x, p.y, rr, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(255,255,255,0.05)"; ctx.lineWidth = 1; ctx.stroke();
   }
 }
 
 function drawTable() {
-  ctx.fillStyle = "#16424c";
-  roundRect(0, 0, W, H, 20);
-  ctx.fill();
-  ctx.fillStyle = "#0d2c33";
-  roundRect(7, 7, W - 14, H - 14, 15);
-  ctx.fill();
+  const rail = ctx.createLinearGradient(0, 0, 0, H);
+  rail.addColorStop(0, "#1e5763");
+  rail.addColorStop(1, "#0f343c");
+  roundRect(0, 0, W, H, 22); ctx.fillStyle = rail; ctx.fill();
+  roundRect(8, 8, W - 16, H - 16, 16); ctx.fillStyle = "#0c2a31"; ctx.fill();
 
   const fx = bounds.left, fy = bounds.top;
   const fw = bounds.right - bounds.left, fh = bounds.bottom - bounds.top;
-  const felt = ctx.createRadialGradient(W / 2, H / 2, 50, W / 2, H / 2, Math.max(fw, fh) * 0.75);
-  felt.addColorStop(0, "#1aa257");
-  felt.addColorStop(1, "#0c6e3b");
-  roundRect(fx, fy, fw, fh, 8);
-  ctx.fillStyle = felt;
-  ctx.fill();
+  const felt = ctx.createRadialGradient(W / 2, H / 2, 40, W / 2, H / 2, Math.max(fw, fh) * 0.8);
+  felt.addColorStop(0, "#1aa45a");
+  felt.addColorStop(1, "#0b6536");
+  roundRect(fx, fy, fw, fh, 7); ctx.fillStyle = felt; ctx.fill();
+
+  ctx.save();
+  roundRect(fx, fy, fw, fh, 7); ctx.clip();
+  for (let k = 0; k < 3; k++) {
+    roundRect(fx + k, fy + k, fw - 2 * k, fh - 2 * k, 7);
+    ctx.strokeStyle = `rgba(0,0,0,${0.16 - k * 0.05})`;
+    ctx.lineWidth = 9 - k * 3;
+    ctx.stroke();
+  }
+  ctx.restore();
 
   drawDiamonds();
-
-  for (const p of pocketCenters()) {
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, TABLE.pocketRadius + 3, 0, Math.PI * 2);
-    ctx.fillStyle = "#0a1f17";
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, TABLE.pocketRadius, 0, Math.PI * 2);
-    ctx.fillStyle = "#04120c";
-    ctx.fill();
-  }
+  drawPockets();
 }
 
-function fillCircle(x, y, r, color) {
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.fillStyle = color;
-  ctx.fill();
+// --- balls -----------------------------------------------------------------
+
+function fillCircle(x, y, r, color) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill(); }
+
+function ballBody(x, y, number, r) {
+  if (isStriped(number)) {
+    fillCircle(x, y, r, "#f4f0e6");
+    ctx.save();
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.clip();
+    ctx.fillStyle = BALL_COLORS[number];
+    ctx.fillRect(x - r, y - r * 0.6, r * 2, r * 1.2);
+    ctx.restore();
+  } else {
+    fillCircle(x, y, r, BALL_COLORS[number]);
+  }
 }
 
 function drawBall(b) {
   const { x, y } = b.pos;
   const r = TABLE.ballRadius;
-  const color = BALL_COLORS[b.number];
 
+  ctx.save();
   ctx.beginPath();
-  ctx.ellipse(x + 1.5, y + 2.5, r, r * 0.92, 0, 0, Math.PI * 2);
-  ctx.fillStyle = "rgba(0,0,0,0.25)";
+  ctx.ellipse(x + 1.5, y + 3, r * 1.02, r * 0.85, 0, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(0,0,0,0.28)";
   ctx.fill();
+  ctx.restore();
 
-  if (isStriped(b.number)) {
-    fillCircle(x, y, r, "#f3efe4");
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.clip();
-    ctx.fillStyle = color;
-    ctx.fillRect(x - r, y - r * 0.55, r * 2, r * 1.1);
-    ctx.restore();
-  } else {
-    fillCircle(x, y, r, color);
-  }
+  ballBody(x, y, b.number, r);
 
   if (b.number > 0) {
-    fillCircle(x, y, r * 0.46, "#fbfaf5");
-    ctx.fillStyle = "#1a1a1a";
-    ctx.font = `bold ${Math.round(r * 0.6)}px system-ui, sans-serif`;
+    fillCircle(x, y, r * 0.5, "#fcfbf6");
+    ctx.fillStyle = "#15171b";
+    ctx.font = `bold ${Math.round(r * 0.66)}px system-ui, sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(String(b.number), x, y + 0.5);
   }
 
-  const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.4, r * 0.1, x, y, r);
-  g.addColorStop(0, "rgba(255,255,255,0.55)");
-  g.addColorStop(0.45, "rgba(255,255,255,0.06)");
-  g.addColorStop(1, "rgba(0,0,0,0.2)");
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.fillStyle = g;
-  ctx.fill();
-
-  ctx.lineWidth = 1;
-  ctx.strokeStyle = "rgba(0,0,0,0.25)";
-  ctx.stroke();
+  const g = ctx.createRadialGradient(x - r * 0.38, y - r * 0.42, r * 0.1, x, y, r);
+  g.addColorStop(0, "rgba(255,255,255,0.6)");
+  g.addColorStop(0.4, "rgba(255,255,255,0.08)");
+  g.addColorStop(1, "rgba(0,0,0,0.22)");
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fillStyle = g; ctx.fill();
+  ctx.lineWidth = 1; ctx.strokeStyle = "rgba(0,0,0,0.28)"; ctx.stroke();
 }
 
-// --- prediction, cue, controls ---------------------------------------------
+// Translucent "future" ball at a predicted resting position.
+function drawGhostBall(pos, number) {
+  const r = TABLE.ballRadius;
+  ctx.save();
+  ctx.globalAlpha = 0.34;
+  ballBody(pos.x, pos.y, number, r);
+  ctx.restore();
+  ctx.save();
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
+  ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 1.3; ctx.stroke();
+  ctx.restore();
+}
+
+// --- prediction overlay ----------------------------------------------------
 
 function shotVelocity() {
-  const dir = { x: Math.cos(state.aimAngle), y: Math.sin(state.aimAngle) };
   const speed = Math.max(0.06, state.power) * MAX_SPEED;
-  return Vec.scale(dir, speed);
+  return { x: Math.cos(state.aimAngle) * speed, y: Math.sin(state.aimAngle) * speed };
 }
 
 function ensurePrediction() {
@@ -536,12 +560,14 @@ function ensurePrediction() {
     state.pred = simulateShot(balls, bounds, shotVelocity());
     state.predDirty = false;
     currentShotTips();
+    scheduleOutcomes();
   }
 }
 
-function strokePath(points, rgba, width) {
-  if (points.length < 2) return;
+function strokePath(points, rgba, width, dash) {
+  if (!points || points.length < 2) return;
   ctx.beginPath();
+  ctx.setLineDash(dash || []);
   ctx.moveTo(points[0].x, points[0].y);
   for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
   ctx.strokeStyle = rgba;
@@ -549,60 +575,162 @@ function strokePath(points, rgba, width) {
   ctx.lineJoin = "round";
   ctx.lineCap = "round";
   ctx.stroke();
+  ctx.setLineDash([]);
 }
 
-function drawPrediction() {
+function arrowHead(at, dir, color, size) {
+  const a = Math.atan2(dir.y, dir.x);
+  size = size || 7;
+  ctx.save();
+  ctx.translate(at.x, at.y);
+  ctx.rotate(a);
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(-size, -size * 0.6);
+  ctx.lineTo(-size, size * 0.6);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function endArrow(points, color) {
+  if (!points || points.length < 2) return;
+  const a = points[points.length - 1], b = points[points.length - 2];
+  arrowHead(a, Vec.sub(a, b), color, 8);
+}
+
+function splitAt(points, contact) {
+  if (!contact) return { pre: points, post: [] };
+  let bi = 0, bd = Infinity;
+  points.forEach((p, i) => { const d = Math.hypot(p.x - contact.x, p.y - contact.y); if (d < bd) { bd = d; bi = i; } });
+  return { pre: points.slice(0, bi + 1).concat([{ x: contact.x, y: contact.y }]), post: points.slice(bi) };
+}
+
+function ghostCircle(pt) {
+  ctx.beginPath(); ctx.arc(pt.x, pt.y, TABLE.ballRadius, 0, Math.PI * 2);
+  ctx.strokeStyle = "rgba(255,80,80,0.95)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.beginPath(); ctx.arc(pt.x, pt.y, 2.2, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(255,80,80,0.95)"; ctx.fill();
+}
+
+function pocketIndexAt(pos) {
+  const ps = pocketCenters();
+  for (let i = 0; i < ps.length; i++) if (Vec.len(Vec.sub(pos, ps[i])) < TABLE.pocketRadius + 4) return i;
+  return -1;
+}
+
+function highlightPocket(i) {
+  if (i < 0) return;
+  const p = pocketCenters()[i];
+  ctx.beginPath(); ctx.arc(p.x, p.y, TABLE.pocketRadius + 7, 0, Math.PI * 2);
+  ctx.strokeStyle = "rgba(74,222,128,0.35)"; ctx.lineWidth = 7; ctx.stroke();
+  ctx.beginPath(); ctx.arc(p.x, p.y, TABLE.pocketRadius + 3, 0, Math.PI * 2);
+  ctx.strokeStyle = "rgba(74,222,128,0.95)"; ctx.lineWidth = 2.5; ctx.stroke();
+}
+
+// Play view: one clean predicted shot + ghost rests of the involved balls.
+function drawPredictionPlay() {
   const pred = state.pred;
   if (!pred) return;
-  for (const t of pred) {
+  const { trails, firstContact } = pred;
+  const cueT = trails.find((t) => t.number === 0);
+  if (!cueT) return;
+
+  if (firstContact) {
+    const { pre, post } = splitAt(cueT.points, firstContact);
+    strokePath(post, "rgba(255,255,255,0.16)", 1.6, [5, 6]);      // faint cue-after path
+    strokePath(pre, "rgba(255,255,255,0.95)", 2.6);               // bright cue-to-contact
+    endArrow(pre, "rgba(255,255,255,0.95)");
+
+    const tt = trails.find((t) => t.number === firstContact.ball);
+    if (tt && tt.moved) {
+      strokePath(tt.points, "rgba(243,210,70,0.95)", 2.4);        // target path
+      endArrow(tt.points, "rgba(243,210,70,0.95)");
+      if (tt.pocketed) highlightPocket(pocketIndexAt(tt.rest));
+      else drawGhostBall(tt.rest, tt.number);
+    }
+    if (!cueT.pocketed) drawGhostBall(cueT.rest, 0);              // ghost cue rest
+    ghostCircle(firstContact);
+  } else {
+    strokePath(cueT.points, "rgba(255,255,255,0.9)", 2.4);
+    endArrow(cueT.points, "rgba(255,255,255,0.9)");
+    if (!cueT.pocketed) drawGhostBall(cueT.rest, 0);
+  }
+}
+
+// Assist view: every ball's path with confidence styling + stop markers.
+function drawPredictionAssist() {
+  const pred = state.pred;
+  if (!pred) return;
+  const { trails, firstContact } = pred;
+  for (const t of trails) {
     const isCue = t.number === 0;
     if (!isCue && !t.moved) continue;
     const rgb = isCue ? "255,255,255" : hexRgb(BALL_COLORS[t.number]);
-
-    strokePath(t.points, `rgba(${rgb},${isCue ? 0.85 : 0.6})`, isCue ? 2.2 : 1.8);
-
-    if (ui.showStops.checked) {
-      if (t.pocketed) {
-        const p = t.rest;
-        ctx.strokeStyle = `rgba(${rgb},0.95)`;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(p.x - 4, p.y - 4); ctx.lineTo(p.x + 4, p.y + 4);
-        ctx.moveTo(p.x + 4, p.y - 4); ctx.lineTo(p.x - 4, p.y + 4);
-        ctx.stroke();
-      } else {
-        ctx.beginPath();
-        ctx.arc(t.rest.x, t.rest.y, TABLE.ballRadius, 0, Math.PI * 2);
-        ctx.strokeStyle = `rgba(${rgb},0.9)`;
-        ctx.lineWidth = 1.6;
-        ctx.stroke();
-      }
+    const primary = isCue || (firstContact && t.number === firstContact.ball);
+    strokePath(t.points, `rgba(${rgb},${primary ? 0.85 : 0.38})`, primary ? 2.2 : 1.6, primary ? [] : [5, 6]);
+    if (t.pocketed) {
+      const p = t.rest;
+      ctx.strokeStyle = `rgba(${rgb},0.95)`; ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(p.x - 4, p.y - 4); ctx.lineTo(p.x + 4, p.y + 4);
+      ctx.moveTo(p.x + 4, p.y - 4); ctx.lineTo(p.x - 4, p.y + 4);
+      ctx.stroke();
+    } else {
+      drawGhostBall(t.rest, t.number);
     }
   }
+  if (firstContact) ghostCircle(firstContact);
+}
+
+function drawAdvisorBadges(onlyTop) {
+  const list = onlyTop ? advisor.list.slice(0, 1) : advisor.list;
+  list.forEach((s, i) => {
+    const b = balls.find((x) => x.active && x.number === s.number);
+    if (!b) return;
+    const bx = b.pos.x, by = b.pos.y - TABLE.ballRadius - 10;
+    ctx.beginPath(); ctx.arc(bx, by, 8, 0, Math.PI * 2);
+    ctx.fillStyle = i === 0 ? "rgba(243,196,61,0.95)" : "rgba(16,24,30,0.9)"; ctx.fill();
+    ctx.lineWidth = 1.5; ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.stroke();
+    ctx.fillStyle = i === 0 ? "#1a1a1a" : "#fff";
+    ctx.font = "bold 10px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(String(onlyTop ? 1 : i + 1), bx, by + 0.5);
+  });
+}
+
+function drawTargetGlow(number, color) {
+  const b = balls.find((x) => x.active && x.number === number);
+  if (!b) return;
+  ctx.beginPath(); ctx.arc(b.pos.x, b.pos.y, TABLE.ballRadius + 4, 0, Math.PI * 2);
+  ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke();
+}
+
+function drawAimRing() {
+  const cue = balls[0];
+  ctx.save();
+  ctx.setLineDash([4, 5]);
+  ctx.beginPath(); ctx.arc(cue.pos.x, cue.pos.y, TABLE.ballRadius + 9, 0, Math.PI * 2);
+  ctx.strokeStyle = state.drag === "aim" ? "rgba(76,194,255,0.85)" : "rgba(255,255,255,0.32)";
+  ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.restore();
 }
 
 function drawCueStick() {
   const cue = balls[0];
   const aim = { x: Math.cos(state.aimAngle), y: Math.sin(state.aimAngle) };
   const back = Vec.scale(aim, -1);
-  const gap = TABLE.ballRadius + 8 + state.power * 46;
+  const gap = TABLE.ballRadius + 10 + state.power * 46;
   const tip = Vec.add(cue.pos, Vec.scale(back, gap));
-  const butt = Vec.add(tip, Vec.scale(back, 195));
-
+  const butt = Vec.add(tip, Vec.scale(back, 200));
   const g = ctx.createLinearGradient(tip.x, tip.y, butt.x, butt.y);
   g.addColorStop(0.0, "#e9e2cf");
   g.addColorStop(0.05, "#2a2a2a");
   g.addColorStop(0.1, "#d2ab5e");
   g.addColorStop(1.0, "#5a3a1a");
-
   ctx.save();
-  ctx.lineCap = "round";
-  ctx.strokeStyle = g;
-  ctx.lineWidth = 7;
-  ctx.beginPath();
-  ctx.moveTo(tip.x, tip.y);
-  ctx.lineTo(butt.x, butt.y);
-  ctx.stroke();
+  ctx.lineCap = "round"; ctx.strokeStyle = g; ctx.lineWidth = 7;
+  ctx.beginPath(); ctx.moveTo(tip.x, tip.y); ctx.lineTo(butt.x, butt.y); ctx.stroke();
   ctx.restore();
 }
 
@@ -613,42 +741,29 @@ function drawPowerMeter() {
   g.addColorStop(0.0, "#e07a1f");
   g.addColorStop(0.5, "#f3c43d");
   g.addColorStop(1.0, "#d33b30");
-  roundRect(r.x, r.y0, r.w, h, 6);
-  ctx.fillStyle = g;
-  ctx.fill();
-
+  roundRect(r.x, r.y0, r.w, h, 6); ctx.fillStyle = g; ctx.fill();
   if (state.power < 1) {
     roundRect(r.x, r.y0, r.w, h * (1 - state.power), 6);
-    ctx.fillStyle = "rgba(8,20,16,0.62)";
-    ctx.fill();
+    ctx.fillStyle = "rgba(8,20,16,0.62)"; ctx.fill();
   }
-
   const ky = r.y1 - state.power * h;
   ctx.fillStyle = state.drag === "power" ? "#4cc2ff" : "#ffffff";
-  roundRect(r.x - 3, ky - 3, r.w + 6, 6, 3);
-  ctx.fill();
+  roundRect(r.x - 3, ky - 3, r.w + 6, 6, 3); ctx.fill();
+}
+
+function line(from, to, color, width) {
+  ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y);
+  ctx.strokeStyle = color; ctx.lineWidth = width || 2; ctx.stroke();
 }
 
 function drawFineDial() {
   const d = fineDial();
   line({ x: d.cx, y: d.y0 }, { x: d.cx, y: d.y1 }, "rgba(255,255,255,0.18)", 2);
-  ctx.beginPath();
-  ctx.arc(d.cx, d.cy, 11, 0, Math.PI * 2);
-  ctx.fillStyle = state.drag === "fine" ? "rgba(76,194,255,0.95)" : "rgba(255,255,255,0.85)";
-  ctx.fill();
-  ctx.strokeStyle = "#0d2c33";
-  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(d.cx, d.cy, 11, 0, Math.PI * 2);
+  ctx.fillStyle = state.drag === "fine" ? "rgba(76,194,255,0.95)" : "rgba(255,255,255,0.85)"; ctx.fill();
+  ctx.strokeStyle = "#0d2c33"; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.moveTo(d.cx - 4, d.cy - 2); ctx.lineTo(d.cx, d.cy - 6); ctx.lineTo(d.cx + 4, d.cy - 2); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(d.cx - 4, d.cy + 2); ctx.lineTo(d.cx, d.cy + 6); ctx.lineTo(d.cx + 4, d.cy + 2); ctx.stroke();
-}
-
-function line(from, to, color, width) {
-  ctx.beginPath();
-  ctx.moveTo(from.x, from.y);
-  ctx.lineTo(to.x, to.y);
-  ctx.strokeStyle = color;
-  ctx.lineWidth = width || 2;
-  ctx.stroke();
 }
 
 // --- loop & input ----------------------------------------------------------
@@ -658,13 +773,21 @@ function render() {
   drawTable();
 
   const moving = !allStopped(balls);
-  if (!moving && ui.showGuides.checked) {
+  const assist = isAssist();
+
+  if (!moving) {
     ensurePrediction();
-    drawPrediction();
+    if (assist) drawPredictionAssist();
+    else drawPredictionPlay();
   }
+
   for (const b of balls) if (b.active) drawBall(b);
-  if (!moving && ui.showGuides.checked) {
-    drawAdvisorBadges();
+
+  if (!moving) {
+    if (advisor.list.length) drawTargetGlow(advisor.list[0].number, "rgba(243,196,61,0.9)");
+    if (state.pred && state.pred.firstContact) drawTargetGlow(state.pred.firstContact.ball, "rgba(255,255,255,0.5)");
+    drawAdvisorBadges(!assist);
+    drawAimRing();
     drawCueStick();
     drawPowerMeter();
     drawFineDial();
@@ -677,7 +800,7 @@ function frame() {
     stepPhysics(balls, bounds);
     pocketBalls();
   } else if (wasMoving) {
-    state.predDirty = true; // table just settled — recompute for the new turn
+    state.predDirty = true;
     evaluateShot();
     scheduleAdvisor();
   }
@@ -688,10 +811,7 @@ function frame() {
 
 function toCanvas(e) {
   const rect = canvas.getBoundingClientRect();
-  return {
-    x: (e.clientX - rect.left) * (W / rect.width),
-    y: (e.clientY - rect.top) * (H / rect.height),
-  };
+  return { x: (e.clientX - rect.left) * (W / rect.width), y: (e.clientY - rect.top) * (H / rect.height) };
 }
 
 function setPowerFromY(y) {
@@ -703,21 +823,16 @@ function setPowerFromY(y) {
 function shoot() {
   if (game.won || game.lost) return;
   game.shotPots = [];
-  const cue = balls[0];
-  cue.vel = shotVelocity();
+  balls[0].vel = shotVelocity();
   state.predDirty = true;
 }
 
 canvas.addEventListener("pointerdown", (e) => {
   if (!allStopped(balls)) return;
   const p = toCanvas(e);
-  if (inPower(p)) {
-    state.drag = "power";
-    setPowerFromY(p.y);
-  } else if (inFine(p)) {
-    state.drag = "fine";
-    state.fineLastY = p.y;
-  } else {
+  if (inPower(p)) { state.drag = "power"; setPowerFromY(p.y); }
+  else if (inFine(p)) { state.drag = "fine"; state.fineLastY = p.y; }
+  else {
     state.drag = "aim";
     const cue = balls[0];
     state.aimAngle = Math.atan2(p.y - cue.pos.y, p.x - cue.pos.x);
@@ -742,12 +857,12 @@ canvas.addEventListener("pointermove", (e) => {
 });
 
 window.addEventListener("pointerup", () => {
-  if (state.drag === "power") shoot(); // release the power slider to strike
+  if (state.drag === "power") shoot();
   state.drag = null;
 });
 
 window.addEventListener("keydown", (e) => {
-  if (e.key === "r" || e.key === "R") { newRack(); }
+  if (e.key === "r" || e.key === "R") newRack();
   else if (e.code === "Space") { e.preventDefault(); if (allStopped(balls)) shoot(); }
 });
 

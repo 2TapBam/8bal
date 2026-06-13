@@ -22,8 +22,9 @@ const TABLE = {
   width: 900,
   height: 500,
   margin: 46,        // rail thickness; the playfield is inset by this
-  ballRadius: 11,
-  pocketRadius: 21,
+  ballRadius: 12.5,  // a touch larger so numbers read clearly
+  pocketRadius: 21,  // capture radius (forgiving; gameplay)
+  pocketMouth: 16.5, // visible opening drawn on the felt (smaller = less cartoonish)
   friction: 0.991,   // per-frame velocity multiplier (rolling resistance)
   stopSpeed: 0.06,   // speeds below this snap to zero
 };
@@ -87,13 +88,22 @@ function stepPhysics(balls, bounds, substeps) {
   }
 }
 
-// Reflect a ball off the table cushions (perfectly elastic).
+// Reflect a ball off the table cushions (perfectly elastic). Inside a pocket's
+// mouth the rail "opens", so a ball heading for a pocket rolls in instead of
+// bouncing back out before the per-frame capture check can grab it.
 function collideCushions(b, bounds) {
   const r = TABLE.ballRadius;
+  const mouth = TABLE.pocketRadius + TABLE.ballRadius; // rail opening near a pocket
+  for (const p of pocketCenters()) {
+    if (Vec.len(Vec.sub(b.pos, p)) < mouth) return; // heading into the pocket
+  }
   if (b.pos.x < bounds.left + r)   { b.pos.x = bounds.left + r;   b.vel.x = Math.abs(b.vel.x); }
   if (b.pos.x > bounds.right - r)  { b.pos.x = bounds.right - r;  b.vel.x = -Math.abs(b.vel.x); }
   if (b.pos.y < bounds.top + r)    { b.pos.y = bounds.top + r;    b.vel.y = Math.abs(b.vel.y); }
   if (b.pos.y > bounds.bottom - r) { b.pos.y = bounds.bottom - r; b.vel.y = -Math.abs(b.vel.y); }
+  // absolute safety so a ball can never escape the felt
+  b.pos.x = Math.max(bounds.left, Math.min(bounds.right, b.pos.x));
+  b.pos.y = Math.max(bounds.top, Math.min(bounds.bottom, b.pos.y));
 }
 
 // Equal-mass elastic collision: the two balls exchange the velocity component

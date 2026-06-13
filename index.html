@@ -3,39 +3,44 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Trajectory Pool — Physics & Aim Simulator</title>
+  <title>Trajectory Pool — Future-Vision Pool Sandbox</title>
   <link rel="stylesheet" href="css/style.css" />
 </head>
 <body>
   <main>
     <h1>Trajectory Pool</h1>
-    <p class="subtitle">A standalone billiards physics sandbox: elastic collisions, cushion bounces, and ghost-ball aim prediction.</p>
+    <p class="subtitle">A standalone pool sandbox that forecasts what your shot is likely to do next.</p>
 
-    <div id="status" class="status" data-state="open">Open table — pot a solid (1&ndash;7) or stripe (9&ndash;15) to claim your group.</div>
+    <div id="status" class="status" data-state="open"><b>Open table</b> &middot; pot any ball to choose your group</div>
 
     <canvas id="table" width="900" height="500"></canvas>
 
     <div class="hud">
-      <div class="instructions">
-        <strong>Aim:</strong> drag on the felt to point the line.
-        <strong>Power:</strong> drag the left slider, release to shoot (or press <kbd>Space</kbd>).
-        <strong>Fine aim:</strong> drag the dial on the right rail for micro-adjustments.
-        <strong>Reset:</strong> press <kbd>R</kbd>.
+      <div class="help">
+        <div><span class="k">Aim</span><span>drag on the table</span></div>
+        <div><span class="k">Power</span><span>drag left slider / Space</span></div>
+        <div><span class="k">Fine aim</span><span>right-rail dial</span></div>
+        <div><span class="k">Reset</span><span>press R</span></div>
       </div>
       <div class="controls">
-        <label><input type="checkbox" id="showGuides" checked /> Aim guides</label>
-        <label><input type="checkbox" id="showStops" checked /> Stop markers</label>
+        <label class="mode">View
+          <select id="mode">
+            <option value="play">Play (clean)</option>
+            <option value="assist">Assist (full solver)</option>
+          </select>
+        </label>
         <button id="reset">Re-rack</button>
       </div>
     </div>
 
     <section class="advisor">
       <div class="panel">
-        <h2>Best shots (1&ndash;5)</h2>
-        <ol id="shotList" class="shot-list"><li>Analyzing the table&hellip;</li></ol>
+        <h2>Best shots</h2>
+        <div id="shotList" class="shot-list">Analyzing the table&hellip;</div>
       </div>
       <div class="panel">
-        <h2>This shot</h2>
+        <h2>This shot&rsquo;s future</h2>
+        <div id="shotStats" class="shot-stats"><p class="muted">Aim a shot to forecast its future.</p></div>
         <ul id="shotTips" class="shot-tips"><li>Aim to see feedback on your shot.</li></ul>
       </div>
     </section>
