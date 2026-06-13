@@ -336,7 +336,40 @@ function evaluateCombo(B, A, pi) {
   };
 }
 
-function typePenalty(type) { return type === "direct" ? 0 : type === "bank" ? 16 : 22; }
+// Cue-ball kick: the cue rebounds off one cushion, then strikes the target,
+// which rolls to the pocket. Mirror the target's ghost across the cushion and
+// aim the cue there; the straight line bends at the rail to reach the ghost.
+function evaluateKick(target, pi, cu) {
+  const cue = balls[0];
+  const P = pocketCenters()[pi];
+  const T = target.pos;
+  const ghostT = ghostPoint(T, P);             // where the cue must arrive to pot T
+  const ghostTm = mirror(ghostT, cu);          // reflect that arrival point across the rail
+  const bp = bankPoint(cue.pos, ghostTm, cu);  // where the cue meets the cushion
+  if (!bp) return null;
+  const reflectedDir = Vec.norm(Vec.sub(ghostT, bp)); // cue's path after the bounce
+  const dirTP = Vec.norm(Vec.sub(P, T));
+  if (Vec.dot(reflectedDir, dirTP) < 0.25) return null; // wrong side / too thin
+  const toAim = Vec.sub(ghostTm, cue.pos);
+  const distCue = Vec.len(toAim);
+  if (distCue < 1) return null;
+  if (pathBlocked(cue.pos, bp, [0, target.number])) return null;
+  if (pathBlocked(bp, ghostT, [0, target.number])) return null;
+  if (pathBlocked(T, P, [0, target.number])) return null;
+  return {
+    type: "kick",
+    number: target.number,
+    pocketIndex: pi,
+    cushion: cu.name,
+    aimAngle: Math.atan2(toAim.y, toAim.x),
+    cutDeg: Math.acos(clamp1(Vec.dot(reflectedDir, dirTP))) * 180 / Math.PI,
+    dist: Vec.len(Vec.sub(bp, cue.pos)) + Vec.len(Vec.sub(ghostT, bp)) + Vec.len(Vec.sub(P, T)),
+  };
+}
+
+function typePenalty(type) {
+  return type === "direct" ? 0 : type === "bank" ? 16 : type === "kick" ? 20 : 22;
+}
 function heuristic(c) { return c.cutDeg + c.dist * 0.05 + typePenalty(c.type); }
 
 // Confirm a candidate by simulating it; require the right ball to drop into the
@@ -372,6 +405,7 @@ function computeRecommendations() {
 
   for (const t of legal) for (let pi = 0; pi < 6; pi++) { const c = evaluateCandidate(t, pi); if (c) cands.push(c); }
   for (const t of legal) for (let pi = 0; pi < 6; pi++) for (const cu of CUSHIONS) { const c = evaluateBank(t, pi, cu); if (c) cands.push(c); }
+  for (const t of legal) for (let pi = 0; pi < 6; pi++) for (const cu of CUSHIONS) { const c = evaluateKick(t, pi, cu); if (c) cands.push(c); }
   for (const B of legal) for (const A of balls) {
     if (!A.active || A.number === 0 || A.number === B.number || !legalSet.has(A.number)) continue;
     for (let pi = 0; pi < 6; pi++) { const c = evaluateCombo(B, A, pi); if (c) cands.push(c); }
@@ -379,7 +413,12 @@ function computeRecommendations() {
 
   // Simulate a promising shortlist, guaranteeing each shot type a few tries.
   const byType = (t) => cands.filter((c) => c.type === t).sort((a, b) => heuristic(a) - heuristic(b));
-  const shortlist = [...byType("direct").slice(0, 7), ...byType("bank").slice(0, 4), ...byType("combo").slice(0, 4)];
+  const shortlist = [
+    ...byType("direct").slice(0, 7),
+    ...byType("bank").slice(0, 4),
+    ...byType("kick").slice(0, 4),
+    ...byType("combo").slice(0, 4),
+  ];
 
   const out = [];
   const seen = new Set();
@@ -402,6 +441,7 @@ function difficultyLabel(s) { return s.quality >= 72 ? "Easy" : s.quality >= 48 
 function shotLabel(s) {
   const base = `${s.number}-ball &rarr; ${POCKET_NAMES[s.pocketIndex]}`;
   if (s.type === "bank") return `${base} <span class="tag bank">bank off ${s.cushion}</span>`;
+  if (s.type === "kick") return `${base} <span class="tag kick">kick off ${s.cushion}</span>`;
   if (s.type === "combo") return `${base} <span class="tag combo">combo via ${s.via}</span>`;
   return base;
 }
@@ -410,6 +450,7 @@ function reasonFor(s) {
   const range = s.dist > Math.hypot(W, H) * 0.6 ? "long range" : "short range";
   const cue = s.scratch ? "cue may scratch — use soft pace" : "clear path, safe cue position";
   if (s.type === "bank") return `bank shot off the ${s.cushion}, ${range}; ${cue}`;
+  if (s.type === "kick") return `cue kicks off the ${s.cushion} to reach it, ${range}; ${cue}`;
   if (s.type === "combo") return `combination through the ${s.via}-ball, ${range}; ${cue}`;
   const cut = s.cutDeg < 8 ? "straight pot" : s.cutDeg < 25 ? "gentle cut" : s.cutDeg < 45 ? "moderate cut" : "thin cut";
   return `${cut}, ${range}; ${cue}`;

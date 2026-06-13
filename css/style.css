@@ -186,6 +186,7 @@ button:hover { filter: brightness(1.08); }
   vertical-align: middle;
 }
 .tag.bank { background: #2a3b52; color: #9ec7ff; }
+.tag.kick { background: #2a4a3b; color: #9ee7c0; }
 .tag.combo { background: #3a2a52; color: #cbb0ff; }
 
 /* This-shot future: probability bars */
