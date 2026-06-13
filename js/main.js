@@ -41,6 +41,18 @@ const statusEl = document.getElementById("status");
 const shotListEl = document.getElementById("shotList");
 const shotStatsEl = document.getElementById("shotStats");
 const shotTipsEl = document.getElementById("shotTips");
+const afterNoteEl = document.getElementById("afterNote");
+
+// Small "after this shot" board.
+const afterCanvas = document.getElementById("afterTable");
+const actx = afterCanvas ? afterCanvas.getContext("2d") : null;
+const AW = afterCanvas ? afterCanvas.width : 380;
+const AH = afterCanvas ? afterCanvas.height : 212;
+if (actx) {
+  afterCanvas.width = AW * dpr;
+  afterCanvas.height = AH * dpr;
+  actx.scale(dpr, dpr);
+}
 const POCKET_NAMES = ["top-left", "top-middle", "top-right", "bottom-left", "bottom-middle", "bottom-right"];
 const advisor = { list: [] };
 
@@ -205,16 +217,22 @@ function clearGeometry(cuePos, target, pi, list) {
   return true;
 }
 
-// Is there any legal clear pot on a resting table?
-function hasClearPot(list) {
+// Is there any clear pot for the given group's numbers on a resting table?
+function hasClearPotFor(list, set) {
   const cue = list.find((b) => b.number === 0);
   if (!cue) return false;
-  const legal = legalNumberSet();
   for (const b of list) {
-    if (b.number === 0 || !legal.has(b.number)) continue;
+    if (b.number === 0 || !set.has(b.number)) continue;
     for (let pi = 0; pi < 6; pi++) if (clearGeometry(cue.pos, b, pi, list)) return true;
   }
   return false;
+}
+function hasClearPot(list) { return hasClearPotFor(list, legalNumberSet()); }
+
+// The opponent's balls (the other group). Null while the table is open.
+function opponentNumberSet() {
+  if (game.won || game.lost || !game.group) return null;
+  return new Set(game.group === "solids" ? [9, 10, 11, 12, 13, 14, 15] : [1, 2, 3, 4, 5, 6, 7]);
 }
 
 // --- shot advisor (ranked options) -----------------------------------------
@@ -647,7 +665,8 @@ function buildRestTable(trails) {
 
 function predictOutcomes(aimAngle, power, samples) {
   samples = samples || 28;
-  let pot = 0, scratch = 0, next = 0, win = 0, lose = 0;
+  const opp = opponentNumberSet();
+  let pot = 0, scratch = 0, next = 0, win = 0, lose = 0, sellout = 0;
   for (let s = 0; s < samples; s++) {
     const a = aimAngle + (Math.random() - 0.5) * 0.016;            // ~±0.5 deg of aim wobble
     const p = Math.max(0.05, power + (Math.random() - 0.5) * 0.06);
@@ -657,13 +676,20 @@ function predictOutcomes(aimAngle, power, samples) {
     const cueScratched = !!(cueT && cueT.pocketed);
     const pottedLegal = trails.some((t) => t.pocketed && t.number !== 0 && isLegalNumber(t.number));
     const potted8 = trails.some((t) => t.pocketed && t.number === 8);
+    const youKeepTurn = pottedLegal && !cueScratched && !potted8;
     if (cueScratched) scratch++;
     if (pottedLegal && !cueScratched) pot++;
     if (potted8) { if (isLegalNumber(8) && !cueScratched) win++; else lose++; }
-    if (!cueScratched && !potted8 && hasClearPot(buildRestTable(trails))) next++;
+    if (youKeepTurn && hasClearPot(buildRestTable(trails))) next++;
+    // sell-out: you give up the table (miss or scratch, not game-ending) AND
+    // the opponent inherits a clear pot.
+    if (opp && !youKeepTurn && !potted8 && hasClearPotFor(buildRestTable(trails), opp)) sellout++;
   }
   const pct = (n) => Math.round((n / samples) * 100);
-  return { pot: pct(pot), scratch: pct(scratch), next: pct(next), win: pct(win), lose: pct(lose) };
+  return {
+    pot: pct(pot), scratch: pct(scratch), next: pct(next),
+    win: pct(win), lose: pct(lose), sellout: opp ? pct(sellout) : null,
+  };
 }
 
 let outcomesTimer = null;
@@ -684,6 +710,7 @@ function renderOutcomes(o) {
        <span class="stat-bar"><i style="width:${val}%"></i></span>
        <b class="stat-v">${val}%</b></div>`;
   let html = bar("Pot", o.pot, "good") + bar("Scratch", o.scratch, "bad") + bar("Next shot", o.next, "neutral");
+  if (o.sellout != null) html += bar("Sell-out", o.sellout, "bad");
   if (o.win) html += bar("Win (8-ball)", o.win, "good");
   if (o.lose) html += bar("Lose (early 8)", o.lose, "bad");
   shotStatsEl.innerHTML = html;
@@ -885,12 +912,68 @@ function shotVelocity() {
   return { x: Math.cos(state.aimAngle) * speed, y: Math.sin(state.aimAngle) * speed };
 }
 
+// Mini board showing where every ball is predicted to come to rest.
+function drawAfterTable() {
+  if (!actx) return;
+  const s = AW / W;
+  actx.clearRect(0, 0, AW, AH);
+  actx.fillStyle = "#0c6e3b";
+  actx.fillRect(0, 0, AW, AH);
+  actx.strokeStyle = "rgba(0,0,0,0.4)";
+  actx.lineWidth = 2;
+  actx.strokeRect(1, 1, AW - 2, AH - 2);
+  actx.fillStyle = "#05140d";
+  for (const p of pocketCenters()) {
+    actx.beginPath();
+    actx.arc(p.x * s, p.y * s, TABLE.pocketMouth * s + 1.5, 0, Math.PI * 2);
+    actx.fill();
+  }
+  const trails = state.pred && state.pred.trails;
+  if (!trails) return;
+  const r = Math.max(2.6, TABLE.ballRadius * s);
+  for (const t of trails) {
+    if (t.pocketed) continue;
+    actx.beginPath();
+    actx.arc(t.rest.x * s, t.rest.y * s, r, 0, Math.PI * 2);
+    actx.fillStyle = t.number === 0 ? "#f6f4ee" : BALL_COLORS[t.number];
+    actx.fill();
+    actx.lineWidth = 0.6;
+    actx.strokeStyle = "rgba(0,0,0,0.45)";
+    actx.stroke();
+  }
+}
+
+function updateAfterNote() {
+  if (!afterNoteEl) return;
+  if (game.won || game.lost) { afterNoteEl.textContent = "Game over — press R to rack again."; return; }
+  const trails = state.pred && state.pred.trails;
+  if (!trails) { afterNoteEl.textContent = ""; return; }
+  const cueT = trails.find((t) => t.number === 0);
+  const scratch = !!(cueT && cueT.pocketed);
+  const pottedLegal = trails.some((t) => t.pocketed && t.number !== 0 && isLegalNumber(t.number));
+  const potted8 = trails.some((t) => t.pocketed && t.number === 8);
+  const opp = opponentNumberSet();
+  if (potted8) {
+    afterNoteEl.textContent = isLegalNumber(8) && !scratch ? "This wins the game." : "This pots the 8 early — you lose.";
+  } else if (scratch) {
+    afterNoteEl.textContent = "Scratch — the cue ball drops; the opponent gets ball in hand.";
+  } else if (pottedLegal) {
+    afterNoteEl.textContent = "You pot and keep shooting — see your next-shot chance above.";
+  } else if (opp && hasClearPotFor(buildRestTable(trails), opp)) {
+    afterNoteEl.textContent = "Miss — this leaves your opponent a clear shot.";
+  } else {
+    afterNoteEl.textContent = "Miss — but it doesn't hand the opponent an obvious shot.";
+  }
+}
+
 function ensurePrediction() {
   if (state.predDirty) {
     state.pred = simulateShot(balls, bounds, shotVelocity());
     state.predDirty = false;
     currentShotTips();
     scheduleOutcomes();
+    drawAfterTable();
+    updateAfterNote();
   }
 }
 

@@ -189,6 +189,17 @@ button:hover { filter: brightness(1.08); }
 .tag.kick { background: #2a4a3b; color: #9ee7c0; }
 .tag.combo { background: #3a2a52; color: #cbb0ff; }
 
+.afterview { margin-top: 16px; }
+#afterTable {
+  display: block;
+  width: 380px;
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+}
+#afterNote { margin-top: 10px; }
+
 /* This-shot future: probability bars */
 .shot-stats { display: flex; flex-direction: column; gap: 7px; margin-bottom: 10px; }
 .stat { display: grid; grid-template-columns: 92px 1fr 44px; align-items: center; gap: 8px; font-size: 0.86rem; }
