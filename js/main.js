@@ -367,8 +367,161 @@ function evaluateKick(target, pi, cu) {
   };
 }
 
+// --- multi-rail shots and caroms -------------------------------------------
+
+function nearPocketMouth(pt) {
+  const m = TABLE.pocketRadius + TABLE.ballRadius;
+  return pocketCenters().some((p) => Vec.len(Vec.sub(pt, p)) < m);
+}
+function rayCushionHit(origin, dir, cu) {
+  const a = cu.at();
+  if (cu.axis === "y") {
+    if (Math.abs(dir.y) < 1e-9) return null;
+    const t = (a - origin.y) / dir.y; if (t <= 1e-6) return null;
+    const x = origin.x + t * dir.x;
+    if (x < bounds.left + TABLE.ballRadius || x > bounds.right - TABLE.ballRadius) return null;
+    return { x, y: a };
+  }
+  if (Math.abs(dir.x) < 1e-9) return null;
+  const t = (a - origin.x) / dir.x; if (t <= 1e-6) return null;
+  const y = origin.y + t * dir.y;
+  if (y < bounds.top + TABLE.ballRadius || y > bounds.bottom - TABLE.ballRadius) return null;
+  return { x: a, y };
+}
+function reflectDir(dir, cu) { return cu.axis === "y" ? { x: dir.x, y: -dir.y } : { x: -dir.x, y: dir.y }; }
+
+// Aim so that travelling start -> (bounce off each cushion in order) -> dest.
+// Reflect dest back across the cushions to get the straight-line aim point,
+// then trace forward to verify every bounce lands on a real rail segment.
+function chainReflect(start, dest, cushions) {
+  let aim = dest;
+  for (let i = cushions.length - 1; i >= 0; i--) aim = mirror(aim, cushions[i]);
+  const aimDir = Vec.norm(Vec.sub(aim, start));
+  let origin = start, dir = aimDir;
+  const bounces = [];
+  for (const cu of cushions) {
+    const hit = rayCushionHit(origin, dir, cu);
+    if (!hit || nearPocketMouth(hit)) return null;
+    bounces.push(hit);
+    origin = hit;
+    dir = reflectDir(dir, cu);
+  }
+  if (Vec.dot(Vec.norm(Vec.sub(dest, origin)), dir) < 0.9) return null;
+  return { aimDir, bounces, finalDir: dir };
+}
+function pathLen(start, mids, end) {
+  let total = 0, prev = start;
+  for (const p of mids) { total += Vec.len(Vec.sub(p, prev)); prev = p; }
+  return total + Vec.len(Vec.sub(end, prev));
+}
+function clearChain(start, mids, end, ignore) {
+  let prev = start;
+  for (const p of mids) { if (pathBlocked(prev, p, ignore)) return false; prev = p; }
+  return !pathBlocked(prev, end, ignore);
+}
+
+// Two-rail bank: the target rebounds off two cushions into the pocket.
+function evaluateBank2(target, pi, cu1, cu2) {
+  if (cu1 === cu2) return null;
+  const cue = balls[0];
+  const P = pocketCenters()[pi];
+  const T = target.pos;
+  const cr = chainReflect(T, P, [cu1, cu2]);
+  if (!cr) return null;
+  const objDir = cr.aimDir;
+  const ghostT = Vec.sub(T, Vec.scale(objDir, 2 * TABLE.ballRadius));
+  const toGhost = Vec.sub(ghostT, cue.pos);
+  const distCue = Vec.len(toGhost);
+  if (distCue < 1) return null;
+  const aimDir = Vec.scale(toGhost, 1 / distCue);
+  if (Vec.dot(aimDir, objDir) < 0.25) return null;
+  if (pathBlocked(cue.pos, ghostT, [0, target.number])) return null;
+  if (!clearChain(T, cr.bounces, P, [0, target.number])) return null;
+  return {
+    type: "bank2", number: target.number, pocketIndex: pi, cushion: `${cu1.name} + ${cu2.name}`,
+    aimAngle: Math.atan2(aimDir.y, aimDir.x),
+    cutDeg: Math.acos(clamp1(Vec.dot(aimDir, objDir))) * 180 / Math.PI,
+    dist: distCue + pathLen(T, cr.bounces, P),
+  };
+}
+
+// Two-rail kick: the cue rebounds off two cushions, then strikes the target.
+function evaluateKick2(target, pi, cu1, cu2) {
+  if (cu1 === cu2) return null;
+  const cue = balls[0];
+  const P = pocketCenters()[pi];
+  const T = target.pos;
+  const ghostT = ghostPoint(T, P);
+  const cr = chainReflect(cue.pos, ghostT, [cu1, cu2]);
+  if (!cr) return null;
+  const dirTP = Vec.norm(Vec.sub(P, T));
+  if (Vec.dot(cr.finalDir, dirTP) < 0.25) return null;
+  if (!clearChain(cue.pos, cr.bounces, ghostT, [0, target.number])) return null;
+  if (pathBlocked(T, P, [0, target.number])) return null;
+  return {
+    type: "kick2", number: target.number, pocketIndex: pi, cushion: `${cu1.name} + ${cu2.name}`,
+    aimAngle: Math.atan2(cr.aimDir.y, cr.aimDir.x),
+    cutDeg: Math.acos(clamp1(Vec.dot(cr.finalDir, dirTP))) * 180 / Math.PI,
+    dist: pathLen(cue.pos, cr.bounces, ghostT) + Vec.len(Vec.sub(P, T)),
+  };
+}
+
+// Carom: the cue glances off ball A and deflects into target B, potting B.
+// For an equal-mass elastic hit the cue keeps only its tangential component,
+// so the post-contact direction is perpendicular to the cue-A line of centres.
+// The contact point therefore lies on the circle of radius 2r around A AND on
+// the Thales circle with diameter A--ghostB (where the cue must meet B).
+function evaluateCarom(B, A, pi) {
+  const cue = balls[0];
+  const P = pocketCenters()[pi];
+  const ghostB = ghostPoint(B.pos, P);
+  const M = Vec.scale(Vec.add(A.pos, ghostB), 0.5);
+  const Rt = Vec.len(Vec.sub(ghostB, A.pos)) / 2;
+  const Ra = 2 * TABLE.ballRadius;
+  const dvec = Vec.sub(M, A.pos);
+  const dd = Vec.len(dvec);
+  if (dd < 1e-6) return null;
+  const aa = (Ra * Ra - Rt * Rt + dd * dd) / (2 * dd);
+  const h2 = Ra * Ra - aa * aa;
+  if (h2 < 0) return null;
+  const h = Math.sqrt(h2);
+  const base = Vec.add(A.pos, Vec.scale(Vec.scale(dvec, 1 / dd), aa));
+  const perp = { x: -dvec.y / dd, y: dvec.x / dd };
+  for (const X of [Vec.add(base, Vec.scale(perp, h)), Vec.sub(base, Vec.scale(perp, h))]) {
+    const dInRaw = Vec.sub(X, cue.pos);
+    if (Vec.len(dInRaw) < 1) continue;
+    const dIn = Vec.norm(dInRaw);
+    const n = Vec.norm(Vec.sub(A.pos, X));
+    if (Vec.dot(dIn, n) <= 0.1) continue;          // must drive into A
+    const tang = Vec.sub(dIn, Vec.scale(n, Vec.dot(dIn, n)));
+    if (Vec.len(tang) < 0.1) continue;             // near head-on: cue would stop
+    const dOut = Vec.norm(tang);
+    const toGhostB = Vec.norm(Vec.sub(ghostB, X));
+    if (Vec.dot(dOut, toGhostB) < 0.92) continue;
+    if (pathBlocked(cue.pos, X, [0, A.number])) continue;
+    if (pathBlocked(X, ghostB, [A.number, B.number])) continue;
+    if (pathBlocked(B.pos, P, [A.number, B.number])) continue;
+    return {
+      type: "carom", number: B.number, via: A.number, pocketIndex: pi,
+      aimAngle: Math.atan2(dIn.y, dIn.x),
+      cutDeg: Math.acos(clamp1(Vec.dot(toGhostB, Vec.norm(Vec.sub(P, B.pos))))) * 180 / Math.PI,
+      dist: Vec.len(dInRaw) + Vec.len(Vec.sub(ghostB, X)) + Vec.len(Vec.sub(P, B.pos)),
+    };
+  }
+  return null;
+}
+
 function typePenalty(type) {
-  return type === "direct" ? 0 : type === "bank" ? 16 : type === "kick" ? 20 : 22;
+  switch (type) {
+    case "direct": return 0;
+    case "bank": return 16;
+    case "kick": return 20;
+    case "combo": return 22;
+    case "carom": return 26;
+    case "bank2": return 28;
+    case "kick2": return 32;
+    default: return 24;
+  }
 }
 function heuristic(c) { return c.cutDeg + c.dist * 0.05 + typePenalty(c.type); }
 
@@ -386,7 +539,7 @@ function validateShot(c) {
     const intoPocket = tt && tt.pocketed &&
       Vec.len(Vec.sub(tt.rest, pocketCenters()[c.pocketIndex])) < TABLE.pocketRadius + 3;
     if (!intoPocket) continue;
-    const wantFirst = c.type === "combo" ? c.via : c.number;
+    const wantFirst = (c.type === "combo" || c.type === "carom") ? c.via : c.number;
     if (firstContact && firstContact.ball !== wantFirst) continue;
     const scratch = !!(cueT && cueT.pocketed);
     const difficulty = (c.cutDeg / 90) * 55 + (c.dist / diag) * 30 + (scratch ? 40 : 0) + p * 8 + typePenalty(c.type);
@@ -406,18 +559,24 @@ function computeRecommendations() {
   for (const t of legal) for (let pi = 0; pi < 6; pi++) { const c = evaluateCandidate(t, pi); if (c) cands.push(c); }
   for (const t of legal) for (let pi = 0; pi < 6; pi++) for (const cu of CUSHIONS) { const c = evaluateBank(t, pi, cu); if (c) cands.push(c); }
   for (const t of legal) for (let pi = 0; pi < 6; pi++) for (const cu of CUSHIONS) { const c = evaluateKick(t, pi, cu); if (c) cands.push(c); }
+  for (const t of legal) for (let pi = 0; pi < 6; pi++) for (const c1 of CUSHIONS) for (const c2 of CUSHIONS) { const c = evaluateBank2(t, pi, c1, c2); if (c) cands.push(c); }
+  for (const t of legal) for (let pi = 0; pi < 6; pi++) for (const c1 of CUSHIONS) for (const c2 of CUSHIONS) { const c = evaluateKick2(t, pi, c1, c2); if (c) cands.push(c); }
   for (const B of legal) for (const A of balls) {
     if (!A.active || A.number === 0 || A.number === B.number || !legalSet.has(A.number)) continue;
     for (let pi = 0; pi < 6; pi++) { const c = evaluateCombo(B, A, pi); if (c) cands.push(c); }
+    for (let pi = 0; pi < 6; pi++) { const c = evaluateCarom(B, A, pi); if (c) cands.push(c); }
   }
 
   // Simulate a promising shortlist, guaranteeing each shot type a few tries.
   const byType = (t) => cands.filter((c) => c.type === t).sort((a, b) => heuristic(a) - heuristic(b));
   const shortlist = [
-    ...byType("direct").slice(0, 7),
-    ...byType("bank").slice(0, 4),
-    ...byType("kick").slice(0, 4),
-    ...byType("combo").slice(0, 4),
+    ...byType("direct").slice(0, 6),
+    ...byType("bank").slice(0, 3),
+    ...byType("kick").slice(0, 3),
+    ...byType("combo").slice(0, 3),
+    ...byType("carom").slice(0, 3),
+    ...byType("bank2").slice(0, 2),
+    ...byType("kick2").slice(0, 2),
   ];
 
   const out = [];
@@ -441,8 +600,11 @@ function difficultyLabel(s) { return s.quality >= 72 ? "Easy" : s.quality >= 48 
 function shotLabel(s) {
   const base = `${s.number}-ball &rarr; ${POCKET_NAMES[s.pocketIndex]}`;
   if (s.type === "bank") return `${base} <span class="tag bank">bank off ${s.cushion}</span>`;
+  if (s.type === "bank2") return `${base} <span class="tag bank">2-rail bank (${s.cushion})</span>`;
   if (s.type === "kick") return `${base} <span class="tag kick">kick off ${s.cushion}</span>`;
+  if (s.type === "kick2") return `${base} <span class="tag kick">2-rail kick (${s.cushion})</span>`;
   if (s.type === "combo") return `${base} <span class="tag combo">combo via ${s.via}</span>`;
+  if (s.type === "carom") return `${base} <span class="tag combo">carom off ${s.via}</span>`;
   return base;
 }
 
@@ -450,8 +612,11 @@ function reasonFor(s) {
   const range = s.dist > Math.hypot(W, H) * 0.6 ? "long range" : "short range";
   const cue = s.scratch ? "cue may scratch — use soft pace" : "clear path, safe cue position";
   if (s.type === "bank") return `bank shot off the ${s.cushion}, ${range}; ${cue}`;
+  if (s.type === "bank2") return `two-rail bank (${s.cushion}), ${range}; ${cue}`;
   if (s.type === "kick") return `cue kicks off the ${s.cushion} to reach it, ${range}; ${cue}`;
+  if (s.type === "kick2") return `two-rail cue kick (${s.cushion}), ${range}; ${cue}`;
   if (s.type === "combo") return `combination through the ${s.via}-ball, ${range}; ${cue}`;
+  if (s.type === "carom") return `cue caroms off the ${s.via}-ball, ${range}; ${cue}`;
   const cut = s.cutDeg < 8 ? "straight pot" : s.cutDeg < 25 ? "gentle cut" : s.cutDeg < 45 ? "moderate cut" : "thin cut";
   return `${cut}, ${range}; ${cue}`;
 }
