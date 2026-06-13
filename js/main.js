@@ -1303,14 +1303,106 @@ function autoSafety() {
   shoot();
 }
 
+// --- run-out lookahead -----------------------------------------------------
+// A self-contained direct-pot solver used to roll the run forward on
+// hypothetical layouts (arrays of {pos, number, active}, cue included).
+
+function groupNumsInLayout(layout, group) {
+  const lo = group === "solids" ? 1 : 9, hi = group === "solids" ? 7 : 15;
+  const rem = layout.filter((b) => b.active && b.number >= lo && b.number <= hi).map((b) => b.number);
+  if (rem.length) return rem;
+  return layout.some((b) => b.active && b.number === 8) ? [8] : [];
+}
+
+function bestDirectShot(layout, nums) {
+  const cue = layout.find((b) => b.number === 0);
+  if (!cue) return null;
+  let best = null;
+  for (const b of layout) {
+    if (!b.active || b.number === 0 || !nums.includes(b.number)) continue;
+    for (let pi = 0; pi < 6; pi++) {
+      const P = pocketCenters()[pi];
+      const dirTP = Vec.norm(Vec.sub(P, b.pos));
+      const ghost = Vec.sub(b.pos, Vec.scale(dirTP, 2 * TABLE.ballRadius));
+      const toG = Vec.sub(ghost, cue.pos);
+      const dC = Vec.len(toG);
+      if (dC < 1) continue;
+      const aimDir = Vec.scale(toG, 1 / dC);
+      if (Vec.dot(aimDir, dirTP) < 0.25) continue;
+      if (pathBlockedIn(layout, cue.pos, ghost, [0, b.number])) continue;
+      if (pathBlockedIn(layout, b.pos, P, [0, b.number])) continue;
+      const aimAngle = Math.atan2(aimDir.y, aimDir.x);
+      const sp = 0.6 * MAX_SPEED;
+      const { trails, firstContact } = simulateShot(layout, bounds, { x: Math.cos(aimAngle) * sp, y: Math.sin(aimAngle) * sp }, 800);
+      const tt = trails.find((t) => t.number === b.number);
+      const cueT = trails.find((t) => t.number === 0);
+      if (!(tt && tt.pocketed && Vec.len(Vec.sub(tt.rest, P)) < TABLE.pocketRadius + 3)) continue;
+      if (firstContact && firstContact.ball !== b.number) continue;
+      const cutDeg = Math.acos(Math.max(-1, Math.min(1, Vec.dot(aimDir, dirTP)))) * 180 / Math.PI;
+      const difficulty = cutDeg + dC * 0.05 + (cueT && cueT.pocketed ? 60 : 0);
+      if (!best || difficulty < best.difficulty) best = { number: b.number, pocketIndex: pi, aimAngle, power: 0.6, difficulty, trails };
+    }
+  }
+  return best;
+}
+
+// Build the layout that results from a shot's simulated trails.
+function resultFromTrails(trails) {
+  const cueT = trails.find((t) => t.number === 0);
+  const scratched = !!(cueT && cueT.pocketed);
+  const layout = trails.filter((t) => !t.pocketed).map((t) => ({ pos: { x: t.rest.x, y: t.rest.y }, number: t.number, active: true }));
+  if (scratched) layout.unshift({ pos: { x: W * 0.26, y: H / 2 }, number: 0, active: true });
+  return { layout, scratched };
+}
+
+// Greedily run the table forward; report whether it reaches a win.
+function rolloutWins(layout, group, maxShots) {
+  let cur = layout;
+  for (let i = 0; i < maxShots; i++) {
+    const nums = groupNumsInLayout(cur, group);
+    if (!nums.length) return { wins: false, cleared: i };
+    const shot = bestDirectShot(cur, nums);
+    if (!shot) return { wins: false, cleared: i };
+    if (nums.length === 1 && nums[0] === 8 && shot.number === 8) return { wins: true, cleared: i + 1 };
+    const res = resultFromTrails(shot.trails);
+    if (res.scratched) return { wins: false, cleared: i + 1 };
+    cur = res.layout;
+  }
+  return { wins: false, cleared: maxShots };
+}
+
+// Pick the first shot whose run-out goes furthest (ideally all the way to a win).
+function planRunout(group) {
+  computeRecommendations();
+  const firsts = advisor.list.slice(0, 4);
+  if (!firsts.length) return null;
+  let best = null;
+  for (const s of firsts) {
+    if (s.number === 8) return s; // potting the 8 ends it now
+    const sp = s.power * MAX_SPEED;
+    const { trails } = simulateShot(balls, bounds, { x: Math.cos(s.aimAngle) * sp, y: Math.sin(s.aimAngle) * sp }, 900);
+    const res = resultFromTrails(trails);
+    const roll = res.scratched ? { wins: false, cleared: 0 } : rolloutWins(res.layout, group, 6);
+    const score = (roll.wins ? 1e6 : 0) + roll.cleared * 1000 - s.difficulty;
+    if (!best || score > best.score) best = { shot: s, score };
+  }
+  return best ? best.shot : firsts[0];
+}
+
 function autoShoot() {
   if (!autoplayOn || game.over || !allStopped(balls)) return;
   if (isBreak()) { breakShot(); return; }
-  computeRecommendations();          // fresh shots for whoever is at the table
-  if (advisor.list.length) {
-    const s = advisor.list[0];
-    state.aimAngle = s.aimAngle;
-    state.power = s.power;
+  const group = game.players[game.turn].group;
+  let shot;
+  if (group) {
+    shot = planRunout(group);
+  } else {
+    computeRecommendations();
+    shot = advisor.list[0] || null;
+  }
+  if (shot) {
+    state.aimAngle = shot.aimAngle;
+    state.power = shot.power;
     state.predDirty = true;
     shoot();
   } else {
