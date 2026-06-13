@@ -34,6 +34,7 @@ const FINE_SENSITIVITY = 0.0015;
 const ui = {
   mode: document.getElementById("mode"), // 'play' | 'assist'
   reset: document.getElementById("reset"),
+  auto: document.getElementById("auto"),
 };
 const isAssist = () => ui.mode && ui.mode.value === "assist";
 
@@ -69,7 +70,19 @@ const state = {
   outcomes: null,    // { pot, scratch, next, win, lose }
 };
 
-const game = { group: null, shotPots: [], won: false, lost: false };
+// Two-player 8-ball. The same engine drives manual play and auto-play.
+const game = {
+  open: true,                 // groups not yet assigned
+  turn: 0,                    // 0 or 1
+  players: [{ group: null }, { group: null }],
+  over: false,
+  winner: null,
+  shotPots: [],               // object balls potted on the shot in progress
+  scratch: false,             // cue ball potted on the shot in progress
+};
+
+let autoplayOn = false;
+let autoTimer = null;
 
 const BALL_COLORS = {
   0: "#f6f4ee",
@@ -106,7 +119,7 @@ function pocketBalls() {
     if (!b.active) continue;
     for (const p of pocketCenters()) {
       if (Vec.len(Vec.sub(b.pos, p)) < TABLE.pocketRadius) {
-        if (b.number === 0) { b.pos = { x: W * 0.26, y: H / 2 }; b.vel = { x: 0, y: 0 }; }
+        if (b.number === 0) { b.pos = { x: W * 0.26, y: H / 2 }; b.vel = { x: 0, y: 0 }; game.scratch = true; }
         else { b.active = false; game.shotPots.push(b.number); }
         break;
       }
@@ -122,56 +135,89 @@ function remainingInGroup(group) {
   return balls.filter((b) => b.active && b.number >= lo && b.number <= hi).length;
 }
 
-function evaluateShot() {
+function inGroup(n, group) { return group === "solids" ? n >= 1 && n <= 7 : n >= 9 && n <= 15; }
+
+function assignGroups(player, group) {
+  game.players[player].group = group;
+  game.players[1 - player].group = group === "solids" ? "stripes" : "solids";
+  game.open = false;
+}
+
+// Resolve a completed shot for the current player: assign groups, decide the
+// 8-ball, and pass the turn on a miss or foul.
+function resolveTurn() {
+  const p = game.turn;
   const pots = game.shotPots;
-  const solids = pots.filter((n) => n >= 1 && n <= 7).length;
-  const stripes = pots.filter((n) => n >= 9 && n <= 15).length;
+  const scratch = game.scratch;
   const eight = pots.includes(8);
-  if (!game.group && !game.won && !game.lost) {
-    if (solids && !stripes) game.group = "solids";
-    else if (stripes && !solids) game.group = "stripes";
+  const solids = pots.some((n) => n >= 1 && n <= 7);
+  const stripes = pots.some((n) => n >= 9 && n <= 15);
+
+  if (game.open && !eight) {
+    if (solids && !stripes) assignGroups(p, "solids");
+    else if (stripes && !solids) assignGroups(p, "stripes");
   }
-  if (eight && !game.won && !game.lost) {
-    if (game.group && remainingInGroup(game.group) === 0) game.won = true;
-    else game.lost = true;
+
+  if (eight) {
+    const myGroup = game.players[p].group;
+    const cleared = myGroup && remainingInGroup(myGroup) === 0;
+    game.over = true;
+    game.winner = (!scratch && myGroup && cleared) ? p : 1 - p;
+    updateStatus();
+    return;
   }
+
+  const myGroup = game.players[p].group;
+  const keepTurn = !scratch && (game.open ? pots.length > 0 : myGroup && pots.some((n) => inGroup(n, myGroup)));
+  if (!keepTurn) game.turn = 1 - p;
   updateStatus();
 }
 
+function playerLabel(pl) {
+  if (!pl.group) return "—";
+  const name = pl.group === "solids" ? "Solids" : "Stripes";
+  const left = remainingInGroup(pl.group);
+  return left > 0 ? `${name} · ${left} left` : `${name} · on the 8`;
+}
+
 function updateStatus() {
-  let html, statusState;
-  if (game.won) { html = "<b>You win!</b> &middot; 8-ball down &middot; press R to rack again"; statusState = "win"; }
-  else if (game.lost) { html = "<b>Game over</b> &middot; 8-ball potted too early &middot; press R to rack again"; statusState = "lose"; }
-  else if (!game.group) { html = "<b>Open table</b> &middot; pot any ball to choose your group"; statusState = "open"; }
-  else {
-    const left = remainingInGroup(game.group);
-    const name = game.group === "solids" ? "Solids" : "Stripes";
-    html = left > 0 ? `<b>${name}:</b> ${left} left &rarr; then 8-ball` : `<b>${name} cleared</b> &rarr; pot the 8-ball to win`;
-    statusState = game.group;
+  if (game.over) {
+    statusEl.innerHTML = `<b>Player ${game.winner + 1} wins!</b> <span class="sep">·</span> press R to rack again`;
+    statusEl.dataset.state = "win";
+    return;
   }
-  statusEl.innerHTML = html;
-  statusEl.dataset.state = statusState;
+  const chips = game.players.map((pl, i) =>
+    `<span class="pl ${i === game.turn ? "turn" : ""}">${i === game.turn ? "▶ " : ""}P${i + 1}: ${playerLabel(pl)}</span>`
+  ).join(`<span class="sep">vs</span>`);
+  const lead = game.open ? `<span class="open-tag">OPEN</span>` : "";
+  statusEl.innerHTML = `${lead}${chips}`;
+  statusEl.dataset.state = game.open ? "open" : (game.players[game.turn].group || "open");
 }
 
 function newRack() {
   balls = rack();
-  game.group = null;
+  game.open = true;
+  game.turn = 0;
+  game.players = [{ group: null }, { group: null }];
+  game.over = false;
+  game.winner = null;
   game.shotPots = [];
-  game.won = false;
-  game.lost = false;
+  game.scratch = false;
   state.predDirty = true;
   state.outcomes = null;
   updateStatus();
   scheduleAdvisor();
+  if (autoplayOn) scheduleAutoShot();
 }
 
 // --- legality helpers ------------------------------------------------------
 
 function legalNumberSet() {
-  if (game.won || game.lost) return new Set();
-  if (!game.group) return new Set([1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15]);
-  if (remainingInGroup(game.group) > 0)
-    return new Set(game.group === "solids" ? [1, 2, 3, 4, 5, 6, 7] : [9, 10, 11, 12, 13, 14, 15]);
+  if (game.over) return new Set();
+  const grp = game.players[game.turn].group;
+  if (!grp) return new Set([1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15]);
+  if (remainingInGroup(grp) > 0)
+    return new Set(grp === "solids" ? [1, 2, 3, 4, 5, 6, 7] : [9, 10, 11, 12, 13, 14, 15]);
   return new Set([8]);
 }
 function isLegalNumber(n) { return legalNumberSet().has(n); }
@@ -229,10 +275,12 @@ function hasClearPotFor(list, set) {
 }
 function hasClearPot(list) { return hasClearPotFor(list, legalNumberSet()); }
 
-// The opponent's balls (the other group). Null while the table is open.
+// The other player's balls. Null while the table is open or the game is over.
 function opponentNumberSet() {
-  if (game.won || game.lost || !game.group) return null;
-  return new Set(game.group === "solids" ? [9, 10, 11, 12, 13, 14, 15] : [1, 2, 3, 4, 5, 6, 7]);
+  if (game.over || game.open) return null;
+  const oppGroup = game.players[1 - game.turn].group;
+  if (!oppGroup) return null;
+  return new Set(oppGroup === "solids" ? [1, 2, 3, 4, 5, 6, 7] : [9, 10, 11, 12, 13, 14, 15]);
 }
 
 // --- shot advisor (ranked options) -----------------------------------------
@@ -641,7 +689,7 @@ function reasonFor(s) {
 
 function renderShotList() {
   if (!shotListEl) return;
-  if (game.won || game.lost) { shotListEl.innerHTML = `<p class="muted">Game over — press R to rack again.</p>`; return; }
+  if (game.over) { shotListEl.innerHTML = `<p class="muted">Game over — press R to rack again.</p>`; return; }
   if (!advisor.list.length) { shotListEl.innerHTML = `<p class="muted">No clear pot, bank, or combo — play safe or break up a cluster.</p>`; return; }
   const best = advisor.list[0];
   let html = `<div class="best">
@@ -696,7 +744,7 @@ let outcomesTimer = null;
 function scheduleOutcomes() {
   if (outcomesTimer) clearTimeout(outcomesTimer);
   outcomesTimer = setTimeout(() => {
-    if (!allStopped(balls) || game.won || game.lost) { state.outcomes = null; renderOutcomes(null); return; }
+    if (!allStopped(balls) || game.over) { state.outcomes = null; renderOutcomes(null); return; }
     state.outcomes = predictOutcomes(state.aimAngle, state.power);
     renderOutcomes(state.outcomes);
   }, 140);
@@ -725,7 +773,7 @@ function renderTips(tips) {
 
 function currentShotTips() {
   if (!shotTipsEl) return;
-  if (game.won || game.lost) { renderTips(["Game over — press R to rack again."]); return; }
+  if (game.over) { renderTips(["Game over — press R to rack again."]); return; }
   const trails = state.pred && state.pred.trails;
   if (!trails) { renderTips([]); return; }
 
@@ -945,7 +993,7 @@ function drawAfterTable() {
 
 function updateAfterNote() {
   if (!afterNoteEl) return;
-  if (game.won || game.lost) { afterNoteEl.textContent = "Game over — press R to rack again."; return; }
+  if (game.over) { afterNoteEl.textContent = "Game over — press R to rack again."; return; }
   const trails = state.pred && state.pred.trails;
   if (!trails) { afterNoteEl.textContent = ""; return; }
   const cueT = trails.find((t) => t.number === 0);
@@ -1214,12 +1262,71 @@ function frame() {
     pocketBalls();
   } else if (wasMoving) {
     state.predDirty = true;
-    evaluateShot();
+    resolveTurn();
     scheduleAdvisor();
+    if (autoplayOn && !game.over) scheduleAutoShot();
   }
   wasMoving = moving;
   render();
   requestAnimationFrame(frame);
+}
+
+// --- auto-play: the engine plays both sides until someone wins -------------
+
+function activeObjectCount() { return balls.filter((b) => b.active && b.number !== 0).length; }
+function isBreak() { return game.open && activeObjectCount() === 15; }
+
+function breakShot() {
+  const cue = balls[0];
+  let apex = null, nd = Infinity;
+  for (const b of balls) {
+    if (!b.active || b.number === 0) continue;
+    const d = Vec.len(Vec.sub(b.pos, cue.pos));
+    if (d < nd) { nd = d; apex = b; }
+  }
+  if (!apex) return;
+  state.aimAngle = Math.atan2(apex.pos.y - cue.pos.y, apex.pos.x - cue.pos.x);
+  state.power = 1;
+  shoot();
+}
+
+// No makeable shot: tap the nearest legal ball so the turn passes cleanly
+// (hitting your own group avoids a foul).
+function autoSafety() {
+  const cue = balls[0];
+  const targets = legalTargets();
+  if (!targets.length) { game.turn = 1 - game.turn; updateStatus(); scheduleAutoShot(); return; }
+  let nearest = targets[0], nd = Infinity;
+  for (const t of targets) { const d = Vec.len(Vec.sub(t.pos, cue.pos)); if (d < nd) { nd = d; nearest = t; } }
+  state.aimAngle = Math.atan2(nearest.pos.y - cue.pos.y, nearest.pos.x - cue.pos.x);
+  state.power = 0.4;
+  shoot();
+}
+
+function autoShoot() {
+  if (!autoplayOn || game.over || !allStopped(balls)) return;
+  if (isBreak()) { breakShot(); return; }
+  computeRecommendations();          // fresh shots for whoever is at the table
+  if (advisor.list.length) {
+    const s = advisor.list[0];
+    state.aimAngle = s.aimAngle;
+    state.power = s.power;
+    state.predDirty = true;
+    shoot();
+  } else {
+    autoSafety();
+  }
+}
+
+function scheduleAutoShot() {
+  if (autoTimer) clearTimeout(autoTimer);
+  autoTimer = setTimeout(autoShoot, 700); // brief pause so the aim is visible
+}
+
+function setAutoplay(on) {
+  autoplayOn = on;
+  if (ui.auto) ui.auto.textContent = on ? "Stop auto-play" : "Auto-play";
+  if (on && !game.over && allStopped(balls)) scheduleAutoShot();
 }
 
 function toCanvas(e) {
@@ -1234,7 +1341,7 @@ function setPowerFromY(y) {
 }
 
 function shoot() {
-  if (game.won || game.lost) return;
+  if (game.over) return;
   game.shotPots = [];
   balls[0].vel = shotVelocity();
   state.predDirty = true;
@@ -1280,6 +1387,7 @@ window.addEventListener("keydown", (e) => {
 });
 
 ui.reset.addEventListener("click", newRack);
+if (ui.auto) ui.auto.addEventListener("click", () => setAutoplay(!autoplayOn));
 
 newRack();
 requestAnimationFrame(frame);
