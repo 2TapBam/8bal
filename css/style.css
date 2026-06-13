@@ -36,6 +36,21 @@ h1 {
   font-size: 0.95rem;
 }
 
+.status {
+  margin: 0 0 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  background: var(--panel);
+  border-left: 4px solid var(--muted);
+}
+
+.status[data-state="solids"] { border-left-color: #f3c43d; }
+.status[data-state="stripes"] { border-left-color: #1f8a4c; }
+.status[data-state="win"] { border-left-color: #2da44e; color: #7ee2a8; }
+.status[data-state="lose"] { border-left-color: #e5484d; color: #ff9aa0; }
+
 canvas {
   display: block;
   width: 100%;

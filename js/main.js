@@ -35,6 +35,7 @@ const ui = {
   showStops: document.getElementById("showStops"),
   reset: document.getElementById("reset"),
 };
+const statusEl = document.getElementById("status");
 
 let balls = [];
 let wasMoving = false;
@@ -46,6 +47,15 @@ const state = {
   fineLastY: 0,
   predDirty: true,
   pred: null,
+};
+
+// 8-ball rules state. `group` is claimed on the first clean pot; `shotPots`
+// collects the balls sunk during the shot in progress.
+const game = {
+  group: null,     // null (open) | 'solids' | 'stripes'
+  shotPots: [],
+  won: false,
+  lost: false,
 };
 
 // Authentic-ish 8-ball colours: 1-7 solids, 8 black, 9-15 stripes, 0 = cue.
@@ -98,11 +108,74 @@ function pocketBalls() {
           b.vel = { x: 0, y: 0 };
         } else {
           b.active = false;
+          game.shotPots.push(b.number);
         }
         break;
       }
     }
   }
+}
+
+// How many of a group's balls are still on the table.
+function remainingInGroup(group) {
+  const lo = group === "solids" ? 1 : 9;
+  const hi = group === "solids" ? 7 : 15;
+  return balls.filter((b) => b.active && b.number >= lo && b.number <= hi).length;
+}
+
+// Apply 8-ball rules once the table settles after a shot.
+function evaluateShot() {
+  const pots = game.shotPots;
+  const solids = pots.filter((n) => n >= 1 && n <= 7).length;
+  const stripes = pots.filter((n) => n >= 9 && n <= 15).length;
+  const eight = pots.includes(8);
+
+  // Claim a group on the first clean pot (mixed pots leave the table open).
+  if (!game.group && !game.won && !game.lost) {
+    if (solids && !stripes) game.group = "solids";
+    else if (stripes && !solids) game.group = "stripes";
+  }
+
+  // The 8-ball decides the game: legal only after your group is cleared.
+  if (eight && !game.won && !game.lost) {
+    if (game.group && remainingInGroup(game.group) === 0) game.won = true;
+    else game.lost = true;
+  }
+
+  updateStatus();
+}
+
+function updateStatus() {
+  let text, statusState;
+  if (game.won) {
+    text = "You sank the 8-ball — you win! Press R to rack again.";
+    statusState = "win";
+  } else if (game.lost) {
+    text = "The 8-ball went down too early — game over. Press R to rack again.";
+    statusState = "lose";
+  } else if (!game.group) {
+    text = "Open table — pot a solid (1–7) or stripe (9–15) to claim your group.";
+    statusState = "open";
+  } else {
+    const left = remainingInGroup(game.group);
+    const name = game.group === "solids" ? "Solids (1–7)" : "Stripes (9–15)";
+    text = left > 0
+      ? `You're ${name} — ${left} ball${left === 1 ? "" : "s"} left, then the 8.`
+      : `You're ${name} — group cleared! Pot the 8-ball to win.`;
+    statusState = game.group;
+  }
+  statusEl.textContent = text;
+  statusEl.dataset.state = statusState;
+}
+
+function newRack() {
+  balls = rack();
+  game.group = null;
+  game.shotPots = [];
+  game.won = false;
+  game.lost = false;
+  state.predDirty = true;
+  updateStatus();
 }
 
 // --- control geometry ------------------------------------------------------
@@ -400,6 +473,7 @@ function frame() {
     pocketBalls();
   } else if (wasMoving) {
     state.predDirty = true; // table just settled — recompute for the new turn
+    evaluateShot();
   }
   wasMoving = moving;
   render();
@@ -421,6 +495,8 @@ function setPowerFromY(y) {
 }
 
 function shoot() {
+  if (game.won || game.lost) return;
+  game.shotPots = [];
   const cue = balls[0];
   cue.vel = shotVelocity();
   state.predDirty = true;
@@ -465,11 +541,11 @@ window.addEventListener("pointerup", () => {
 });
 
 window.addEventListener("keydown", (e) => {
-  if (e.key === "r" || e.key === "R") { balls = rack(); state.predDirty = true; }
+  if (e.key === "r" || e.key === "R") { newRack(); }
   else if (e.code === "Space") { e.preventDefault(); if (allStopped(balls)) shoot(); }
 });
 
-ui.reset.addEventListener("click", () => { balls = rack(); state.predDirty = true; });
+ui.reset.addEventListener("click", newRack);
 
-balls = rack();
+newRack();
 requestAnimationFrame(frame);
