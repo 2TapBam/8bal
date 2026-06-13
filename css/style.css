@@ -176,6 +176,18 @@ button:hover { filter: brightness(1.08); }
 }
 .rank .meta { color: var(--muted); font-size: 0.85em; }
 
+.tag {
+  display: inline-block;
+  font-size: 0.72em;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+.tag.bank { background: #2a3b52; color: #9ec7ff; }
+.tag.combo { background: #3a2a52; color: #cbb0ff; }
+
 /* This-shot future: probability bars */
 .shot-stats { display: flex; flex-direction: column; gap: 7px; margin-bottom: 10px; }
 .stat { display: grid; grid-template-columns: 92px 1fr 44px; align-items: center; gap: 8px; font-size: 0.86rem; }

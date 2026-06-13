@@ -219,12 +219,18 @@ function hasClearPot(list) {
 
 // --- shot advisor (ranked options) -----------------------------------------
 
+function clamp1(x) { return Math.max(-1, Math.min(1, x)); }
+function ghostPoint(ballPos, towardPos) {
+  return Vec.sub(ballPos, Vec.scale(Vec.norm(Vec.sub(towardPos, ballPos)), 2 * TABLE.ballRadius));
+}
+
+// Direct pot: cue strikes the target, target rolls straight to the pocket.
 function evaluateCandidate(target, pi) {
   const cue = balls[0];
   const P = pocketCenters()[pi];
   const T = target.pos;
   const dirTP = Vec.norm(Vec.sub(P, T));
-  const ghost = Vec.sub(T, Vec.scale(dirTP, 2 * TABLE.ballRadius));
+  const ghost = ghostPoint(T, P);
   const toGhost = Vec.sub(ghost, cue.pos);
   const distCue = Vec.len(toGhost);
   if (distCue < 1) return null;
@@ -234,28 +240,123 @@ function evaluateCandidate(target, pi) {
   if (pathBlocked(cue.pos, ghost, [0, target.number])) return null;
   if (pathBlocked(T, P, [0, target.number])) return null;
   return {
+    type: "direct",
     number: target.number,
     pocketIndex: pi,
     aimAngle: Math.atan2(aimDir.y, aimDir.x),
-    cutDeg: Math.acos(Math.max(-1, Math.min(1, dot))) * 180 / Math.PI,
+    cutDeg: Math.acos(clamp1(dot)) * 180 / Math.PI,
     dist: distCue + Vec.len(Vec.sub(P, T)),
   };
 }
 
-function validateAndScore(c) {
+// Cushions seen by a ball *centre* (inset by the ball radius).
+const CUSHIONS = [
+  { axis: "y", at: () => bounds.top + TABLE.ballRadius, name: "top rail" },
+  { axis: "y", at: () => bounds.bottom - TABLE.ballRadius, name: "bottom rail" },
+  { axis: "x", at: () => bounds.left + TABLE.ballRadius, name: "left rail" },
+  { axis: "x", at: () => bounds.right - TABLE.ballRadius, name: "right rail" },
+];
+function mirror(P, cu) {
+  const a = cu.at();
+  return cu.axis === "y" ? { x: P.x, y: 2 * a - P.y } : { x: 2 * a - P.x, y: P.y };
+}
+function bankPoint(T, Pm, cu) {
+  const a = cu.at();
+  if (cu.axis === "y") {
+    const d = Pm.y - T.y; if (Math.abs(d) < 1e-6) return null;
+    const t = (a - T.y) / d; if (t <= 0 || t >= 1) return null;
+    const x = T.x + t * (Pm.x - T.x);
+    if (x < bounds.left + TABLE.ballRadius || x > bounds.right - TABLE.ballRadius) return null;
+    return { x, y: a };
+  }
+  const d = Pm.x - T.x; if (Math.abs(d) < 1e-6) return null;
+  const t = (a - T.x) / d; if (t <= 0 || t >= 1) return null;
+  const y = T.y + t * (Pm.y - T.y);
+  if (y < bounds.top + TABLE.ballRadius || y > bounds.bottom - TABLE.ballRadius) return null;
+  return { x: a, y };
+}
+
+// Bank pot: target rebounds off one cushion into the pocket. Aiming the target
+// at the pocket mirrored across that cushion produces the bank (cushions are
+// perfectly elastic here, so the mirror image is exact).
+function evaluateBank(target, pi, cu) {
+  const cue = balls[0];
+  const P = pocketCenters()[pi];
+  const T = target.pos;
+  const Pm = mirror(P, cu);
+  const bp = bankPoint(T, Pm, cu);
+  if (!bp) return null;
+  const dirTPm = Vec.norm(Vec.sub(Pm, T));
+  const ghost = ghostPoint(T, Pm);
+  const toGhost = Vec.sub(ghost, cue.pos);
+  const distCue = Vec.len(toGhost);
+  if (distCue < 1) return null;
+  const aimDir = Vec.scale(toGhost, 1 / distCue);
+  const dot = Vec.dot(aimDir, dirTPm);
+  if (dot < 0.25) return null;
+  if (pathBlocked(cue.pos, ghost, [0, target.number])) return null;
+  if (pathBlocked(T, bp, [0, target.number])) return null;
+  if (pathBlocked(bp, P, [0, target.number])) return null;
+  return {
+    type: "bank",
+    number: target.number,
+    pocketIndex: pi,
+    cushion: cu.name,
+    aimAngle: Math.atan2(aimDir.y, aimDir.x),
+    cutDeg: Math.acos(clamp1(dot)) * 180 / Math.PI,
+    dist: distCue + Vec.len(Vec.sub(bp, T)) + Vec.len(Vec.sub(P, bp)),
+  };
+}
+
+// Combination: cue strikes ball A, which strikes target B into the pocket.
+function evaluateCombo(B, A, pi) {
+  const cue = balls[0];
+  const P = pocketCenters()[pi];
+  const ghostB = ghostPoint(B.pos, P);                    // where A must hit B
+  const dirAB = Vec.norm(Vec.sub(ghostB, A.pos));
+  const ghostA = Vec.sub(A.pos, Vec.scale(dirAB, 2 * TABLE.ballRadius)); // where cue hits A
+  const toGhostA = Vec.sub(ghostA, cue.pos);
+  const distCue = Vec.len(toGhostA);
+  if (distCue < 1) return null;
+  const aimDir = Vec.scale(toGhostA, 1 / distCue);
+  const cutCueA = Vec.dot(aimDir, dirAB);
+  const cutAB = Vec.dot(dirAB, Vec.norm(Vec.sub(P, B.pos)));
+  if (cutCueA < 0.3 || cutAB < 0.3) return null;
+  if (pathBlocked(cue.pos, ghostA, [0, A.number])) return null;
+  if (pathBlocked(A.pos, ghostB, [A.number, B.number])) return null;
+  if (pathBlocked(B.pos, P, [A.number, B.number])) return null;
+  return {
+    type: "combo",
+    number: B.number,
+    via: A.number,
+    pocketIndex: pi,
+    aimAngle: Math.atan2(aimDir.y, aimDir.x),
+    cutDeg: Math.acos(clamp1(Math.min(cutCueA, cutAB))) * 180 / Math.PI,
+    dist: distCue + Vec.len(Vec.sub(ghostB, A.pos)) + Vec.len(Vec.sub(P, B.pos)),
+  };
+}
+
+function typePenalty(type) { return type === "direct" ? 0 : type === "bank" ? 16 : 22; }
+function heuristic(c) { return c.cutDeg + c.dist * 0.05 + typePenalty(c.type); }
+
+// Confirm a candidate by simulating it; require the right ball to drop into the
+// intended pocket, and the first contact to be the right ball (A for combos).
+function validateShot(c) {
   const diag = Math.hypot(W, H);
   let best = null;
-  for (const p of [0.5, 0.8]) {
-    const speed = p * MAX_SPEED;
-    const vel = { x: Math.cos(c.aimAngle) * speed, y: Math.sin(c.aimAngle) * speed };
-    const { trails } = simulateShot(balls, bounds, vel, 700);
+  for (const p of [0.55, 0.85]) {
+    const sp = p * MAX_SPEED;
+    const { trails, firstContact } = simulateShot(balls, bounds,
+      { x: Math.cos(c.aimAngle) * sp, y: Math.sin(c.aimAngle) * sp }, 900);
     const tt = trails.find((t) => t.number === c.number);
     const cueT = trails.find((t) => t.number === 0);
     const intoPocket = tt && tt.pocketed &&
       Vec.len(Vec.sub(tt.rest, pocketCenters()[c.pocketIndex])) < TABLE.pocketRadius + 3;
     if (!intoPocket) continue;
+    const wantFirst = c.type === "combo" ? c.via : c.number;
+    if (firstContact && firstContact.ball !== wantFirst) continue;
     const scratch = !!(cueT && cueT.pocketed);
-    const difficulty = (c.cutDeg / 90) * 55 + (c.dist / diag) * 35 + (scratch ? 40 : 0) + p * 8;
+    const difficulty = (c.cutDeg / 90) * 55 + (c.dist / diag) * 30 + (scratch ? 40 : 0) + p * 8 + typePenalty(c.type);
     if (!best || difficulty < best.difficulty) {
       best = { ...c, power: p, scratch, difficulty, quality: Math.max(5, Math.round(100 - difficulty)) };
     }
@@ -265,17 +366,30 @@ function validateAndScore(c) {
 
 function computeRecommendations() {
   if (!allStopped(balls)) return;
+  const legal = legalTargets();
+  const legalSet = legalNumberSet();
+  const cands = [];
+
+  for (const t of legal) for (let pi = 0; pi < 6; pi++) { const c = evaluateCandidate(t, pi); if (c) cands.push(c); }
+  for (const t of legal) for (let pi = 0; pi < 6; pi++) for (const cu of CUSHIONS) { const c = evaluateBank(t, pi, cu); if (c) cands.push(c); }
+  for (const B of legal) for (const A of balls) {
+    if (!A.active || A.number === 0 || A.number === B.number || !legalSet.has(A.number)) continue;
+    for (let pi = 0; pi < 6; pi++) { const c = evaluateCombo(B, A, pi); if (c) cands.push(c); }
+  }
+
+  // Simulate a promising shortlist, guaranteeing each shot type a few tries.
+  const byType = (t) => cands.filter((c) => c.type === t).sort((a, b) => heuristic(a) - heuristic(b));
+  const shortlist = [...byType("direct").slice(0, 7), ...byType("bank").slice(0, 4), ...byType("combo").slice(0, 4)];
+
   const out = [];
-  for (const t of legalTargets()) {
-    const cands = [];
-    for (let pi = 0; pi < 6; pi++) { const c = evaluateCandidate(t, pi); if (c) cands.push(c); }
-    cands.sort((a, b) => (a.cutDeg + a.dist * 0.05) - (b.cutDeg + b.dist * 0.05));
-    let bestForBall = null;
-    for (const c of cands.slice(0, 2)) {
-      const s = validateAndScore(c);
-      if (s && (!bestForBall || s.difficulty < bestForBall.difficulty)) bestForBall = s;
-    }
-    if (bestForBall) out.push(bestForBall);
+  const seen = new Set();
+  for (const c of shortlist) {
+    const s = validateShot(c);
+    if (!s) continue;
+    const key = `${s.type}-${s.number}-${s.pocketIndex}-${s.via || ""}-${s.cushion || ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
   }
   out.sort((a, b) => a.difficulty - b.difficulty);
   advisor.list = out.slice(0, 5);
@@ -284,26 +398,36 @@ function computeRecommendations() {
 function scheduleAdvisor() { setTimeout(computeRecommendations, 0); }
 
 function difficultyLabel(s) { return s.quality >= 72 ? "Easy" : s.quality >= 48 ? "Medium" : "Hard"; }
+
+function shotLabel(s) {
+  const base = `${s.number}-ball &rarr; ${POCKET_NAMES[s.pocketIndex]}`;
+  if (s.type === "bank") return `${base} <span class="tag bank">bank off ${s.cushion}</span>`;
+  if (s.type === "combo") return `${base} <span class="tag combo">combo via ${s.via}</span>`;
+  return base;
+}
+
 function reasonFor(s) {
-  const cut = s.cutDeg < 8 ? "straight pot" : s.cutDeg < 25 ? "gentle cut" : s.cutDeg < 45 ? "moderate cut" : "thin cut";
   const range = s.dist > Math.hypot(W, H) * 0.6 ? "long range" : "short range";
   const cue = s.scratch ? "cue may scratch — use soft pace" : "clear path, safe cue position";
+  if (s.type === "bank") return `bank shot off the ${s.cushion}, ${range}; ${cue}`;
+  if (s.type === "combo") return `combination through the ${s.via}-ball, ${range}; ${cue}`;
+  const cut = s.cutDeg < 8 ? "straight pot" : s.cutDeg < 25 ? "gentle cut" : s.cutDeg < 45 ? "moderate cut" : "thin cut";
   return `${cut}, ${range}; ${cue}`;
 }
 
 function renderShotList() {
   if (!shotListEl) return;
   if (game.won || game.lost) { shotListEl.innerHTML = `<p class="muted">Game over — press R to rack again.</p>`; return; }
-  if (!advisor.list.length) { shotListEl.innerHTML = `<p class="muted">No clear pot — play safe or break up a cluster.</p>`; return; }
+  if (!advisor.list.length) { shotListEl.innerHTML = `<p class="muted">No clear pot, bank, or combo — play safe or break up a cluster.</p>`; return; }
   const best = advisor.list[0];
   let html = `<div class="best">
-      <div class="best-line"><span class="rankdot">1</span> <b>${best.number}-ball</b> &rarr; ${POCKET_NAMES[best.pocketIndex]}</div>
+      <div class="best-line"><span class="rankdot">1</span> ${shotLabel(best)}</div>
       <div class="best-meta"><span>Difficulty: <b>${difficultyLabel(best)}</b></span><span>Success: <b>${best.quality}%</b></span></div>
       <div class="best-reason">${reasonFor(best)}</div>
     </div>`;
   if (advisor.list.length > 1) {
     html += `<ol class="rank" start="2">` + advisor.list.slice(1).map((s) =>
-      `<li>${s.number}-ball &rarr; ${POCKET_NAMES[s.pocketIndex]} <span class="meta">${difficultyLabel(s)} &middot; ${s.quality}%</span></li>`
+      `<li>${shotLabel(s)} <span class="meta">${difficultyLabel(s)} &middot; ${s.quality}%</span></li>`
     ).join("") + `</ol>`;
   }
   shotListEl.innerHTML = html;
