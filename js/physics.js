@@ -61,22 +61,29 @@ class Ball {
   }
 }
 
-// Advance every ball one step: integrate motion, apply friction, resolve
-// cushion and ball-to-ball collisions.
-function stepPhysics(balls, bounds) {
+// Advance every ball one frame. Motion and collisions are sub-stepped so fast
+// balls move smoothly and never tunnel through each other or the cushions;
+// friction is applied once per frame so the stopping distance is unchanged.
+function stepPhysics(balls, bounds, substeps) {
+  const k = substeps || 4;
+  for (let s = 0; s < k; s++) {
+    for (const b of balls) {
+      if (!b.active) continue;
+      b.pos.x += b.vel.x / k;
+      b.pos.y += b.vel.y / k;
+      collideCushions(b, bounds);
+    }
+    for (let i = 0; i < balls.length; i++) {
+      for (let j = i + 1; j < balls.length; j++) {
+        if (balls[i].active && balls[j].active) collideBalls(balls[i], balls[j]);
+      }
+    }
+  }
   for (const b of balls) {
     if (!b.active) continue;
-    b.pos.x += b.vel.x;
-    b.pos.y += b.vel.y;
     b.vel.x *= TABLE.friction;
     b.vel.y *= TABLE.friction;
     if (Vec.len(b.vel) < TABLE.stopSpeed) { b.vel.x = 0; b.vel.y = 0; }
-    collideCushions(b, bounds);
-  }
-  for (let i = 0; i < balls.length; i++) {
-    for (let j = i + 1; j < balls.length; j++) {
-      if (balls[i].active && balls[j].active) collideBalls(balls[i], balls[j]);
-    }
   }
 }
 

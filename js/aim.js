@@ -1,93 +1,73 @@
 "use strict";
 
 // ---------------------------------------------------------------------------
-// aim.js — trajectory prediction (the "aim guide").
+// aim.js — full-shot prediction.
 //
-// Casts a ray from the cue ball along the aim direction. The ray bounces off
-// cushions until it reaches the first ball it would strike. At that contact it
-// reports the ghost-ball position and the resulting directions of both balls:
-//   - object ball travels along the line of centres (ghost -> object)
-//   - cue ball deflects along the perpendicular ("tangent line") for an ideal
-//     equal-mass, spin-free collision.
+// Instead of only finding the first ball struck, this clones the table and
+// plays the entire shot forward at the chosen power: the cue ball travels,
+// bounces off cushions, strikes balls, those balls move and strike others, and
+// so on until everything comes to rest. It returns one trail per ball — the
+// path it follows and where it finally stops (or which pocket it falls into).
 // ---------------------------------------------------------------------------
 
-// Distance along ray `origin + t*d` at which it first touches another ball.
-// Solves |(origin - B) + t*d|^2 = (2r)^2 for the smaller positive root.
-function firstBallHit(origin, d, balls, cue) {
-  const diameter = TABLE.ballRadius * 2;
-  let best = null;
-  for (const b of balls) {
-    if (!b.active || b === cue) continue;
-    const f = Vec.sub(origin, b.pos);
-    const proj = Vec.dot(f, d);
-    const c = Vec.dot(f, f) - diameter * diameter;
-    const disc = proj * proj - c;
-    if (disc < 0) continue;                 // ray misses this ball
-    const t = -proj - Math.sqrt(disc);      // entry point (smaller root)
-    if (t < 1e-6) continue;                 // behind or at the origin
-    if (!best || t < best.t) best = { t, ball: b };
-  }
-  return best;
-}
+function simulateShot(balls, bounds, cueVel, maxSteps) {
+  maxSteps = maxSteps || 1100;
 
-// Distance to the first cushion the ray reaches, plus the reflected direction.
-function cushionHit(origin, d, bounds) {
-  const r = TABLE.ballRadius;
-  const left = bounds.left + r, right = bounds.right - r;
-  const top = bounds.top + r, bottom = bounds.bottom - r;
-  let best = null;
+  // Clone the active balls (order preserved, cue ball stays index 0).
+  const sim = balls.filter((b) => b.active).map((b) => new Ball(b.pos.x, b.pos.y, b.number));
+  if (sim.length === 0) return [];
+  sim[0].vel = { x: cueVel.x, y: cueVel.y };
 
-  const consider = (t, normal) => {
-    if (t <= 1e-6) return;
-    if (best && t >= best.t) return;
-    const point = Vec.add(origin, Vec.scale(d, t));
-    const dn = Vec.dot(d, normal);
-    const reflect = Vec.sub(d, Vec.scale(normal, 2 * dn));
-    best = { t, point, reflect };
-  };
+  const trails = sim.map((b) => ({
+    number: b.number,
+    points: [{ x: b.pos.x, y: b.pos.y }],
+    moved: false,
+    pocketed: false,
+    rest: { x: b.pos.x, y: b.pos.y },
+  }));
 
-  if (d.x > 1e-9)       consider((right - origin.x) / d.x, { x: 1, y: 0 });
-  else if (d.x < -1e-9) consider((left - origin.x) / d.x,  { x: 1, y: 0 });
-  if (d.y > 1e-9)       consider((bottom - origin.y) / d.y, { x: 0, y: 1 });
-  else if (d.y < -1e-9) consider((top - origin.y) / d.y,    { x: 0, y: 1 });
+  const pockets = pocketCenters();
 
-  return best;
-}
+  for (let s = 0; s < maxSteps && !allStopped(sim); s++) {
+    stepPhysics(sim, bounds);
 
-// Build the predicted path. Returns { segments, contact } where `segments` are
-// line pieces to draw and `contact` (if any) describes the ball that is struck.
-function predictTrajectory(cue, balls, dir, bounds, maxBounces) {
-  const result = { segments: [], contact: null };
-  let origin = { x: cue.pos.x, y: cue.pos.y };
-  let d = Vec.norm(dir);
+    for (let i = 0; i < sim.length; i++) {
+      const b = sim[i];
+      if (!b.active) continue;
 
-  for (let bounce = 0; bounce <= maxBounces; bounce++) {
-    const ball = firstBallHit(origin, d, balls, cue);
-    const cushion = cushionHit(origin, d, bounds);
+      // pocket capture
+      let dropped = false;
+      for (const p of pockets) {
+        if (Vec.len(Vec.sub(b.pos, p)) < TABLE.pocketRadius) {
+          b.active = false;
+          const t = trails[i];
+          t.pocketed = true;
+          t.moved = true;
+          t.points.push({ x: p.x, y: p.y });
+          t.rest = { x: p.x, y: p.y };
+          dropped = true;
+          break;
+        }
+      }
+      if (dropped) continue;
 
-    if (ball && (!cushion || ball.t <= cushion.t)) {
-      const ghost = Vec.add(origin, Vec.scale(d, ball.t));
-      const objDir = Vec.norm(Vec.sub(ball.ball.pos, ghost));
-      const along = Vec.scale(objDir, Vec.dot(d, objDir));
-      const cueResidual = Vec.sub(d, along);
-      result.segments.push({ from: origin, to: ghost });
-      result.contact = {
-        ghost,
-        objDir,
-        cueDir: Vec.norm(cueResidual),
-        hasCueDeflection: Vec.len(cueResidual) > 1e-3,
-      };
-      return result;
-    }
-
-    if (cushion) {
-      result.segments.push({ from: origin, to: cushion.point });
-      origin = cushion.point;
-      d = cushion.reflect;
-    } else {
-      result.segments.push({ from: origin, to: Vec.add(origin, Vec.scale(d, 4000)) });
-      return result;
+      // sample the path when the ball has moved far enough to matter
+      const t = trails[i];
+      const last = t.points[t.points.length - 1];
+      if (Math.hypot(b.pos.x - last.x, b.pos.y - last.y) > 3) {
+        t.points.push({ x: b.pos.x, y: b.pos.y });
+        t.moved = true;
+      }
     }
   }
-  return result;
+
+  // record final resting positions for balls still on the table
+  for (let i = 0; i < sim.length; i++) {
+    if (sim[i].active) {
+      trails[i].rest = { x: sim[i].pos.x, y: sim[i].pos.y };
+      trails[i].points.push({ x: sim[i].pos.x, y: sim[i].pos.y });
+    }
+  }
+
+  return trails;
 }
