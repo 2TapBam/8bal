@@ -30,6 +30,10 @@ ctx.scale(dpr, dpr);
 
 const MAX_SPEED = 19;
 const FINE_SENSITIVITY = 0.0015;
+const PREVIEW_POWER = 0.6;   // power used to draw the aim guide before you choose strength
+const POWER_MIN = 0.05;      // below this the slider counts as "no shot" (cancel)
+const AUTO_THINK = 1100;     // ms the AI "looks" before lining up a shot
+const AUTO_STRIKE = 1000;    // ms it holds the aim before striking
 
 const ui = {
   mode: document.getElementById("mode"), // 'play' | 'assist'
@@ -62,7 +66,7 @@ let wasMoving = false;
 
 const state = {
   aimAngle: 0,
-  power: 0.55,
+  power: 0,          // starts at 0 each shot; drag the slider to choose strength
   drag: null,        // 'aim' | 'power' | 'fine'
   fineLastY: 0,
   predDirty: true,
@@ -203,6 +207,7 @@ function newRack() {
   game.winner = null;
   game.shotPots = [];
   game.scratch = false;
+  state.power = 0;
   state.predDirty = true;
   state.outcomes = null;
   updateStatus();
@@ -745,7 +750,7 @@ function scheduleOutcomes() {
   if (outcomesTimer) clearTimeout(outcomesTimer);
   outcomesTimer = setTimeout(() => {
     if (!allStopped(balls) || game.over) { state.outcomes = null; renderOutcomes(null); return; }
-    state.outcomes = predictOutcomes(state.aimAngle, state.power);
+    state.outcomes = predictOutcomes(state.aimAngle, effectivePower());
     renderOutcomes(state.outcomes);
   }, 140);
 }
@@ -865,17 +870,21 @@ function drawPockets() {
 }
 
 function drawTable() {
+  // dark red wooden rail with a lighter glossy top edge
   const rail = ctx.createLinearGradient(0, 0, 0, H);
-  rail.addColorStop(0, "#1e5763");
-  rail.addColorStop(1, "#0f343c");
+  rail.addColorStop(0, "#8a3b34");
+  rail.addColorStop(0.5, "#6e2a26");
+  rail.addColorStop(1, "#4c1c1a");
   roundRect(0, 0, W, H, 22); ctx.fillStyle = rail; ctx.fill();
-  roundRect(8, 8, W - 16, H - 16, 16); ctx.fillStyle = "#0c2a31"; ctx.fill();
+  roundRect(6, 6, W - 12, H - 12, 18); ctx.fillStyle = "rgba(255,255,255,0.06)"; ctx.fill();
+  roundRect(9, 9, W - 18, H - 18, 16); ctx.fillStyle = "#3a1513"; ctx.fill();
 
   const fx = bounds.left, fy = bounds.top;
   const fw = bounds.right - bounds.left, fh = bounds.bottom - bounds.top;
-  const felt = ctx.createRadialGradient(W / 2, H / 2, 40, W / 2, H / 2, Math.max(fw, fh) * 0.8);
-  felt.addColorStop(0, "#1aa45a");
-  felt.addColorStop(1, "#0b6536");
+  // blue felt, lighter in the centre
+  const felt = ctx.createRadialGradient(W / 2, H / 2, 40, W / 2, H / 2, Math.max(fw, fh) * 0.85);
+  felt.addColorStop(0, "#4f93c9");
+  felt.addColorStop(1, "#2a648f");
   roundRect(fx, fy, fw, fh, 7); ctx.fillStyle = felt; ctx.fill();
 
   ctx.save();
@@ -955,8 +964,17 @@ function drawGhostBall(pos, number) {
 
 // --- prediction overlay ----------------------------------------------------
 
+// Real strength of the shot when it is actually struck.
 function shotVelocity() {
   const speed = Math.max(0.06, state.power) * MAX_SPEED;
+  return { x: Math.cos(state.aimAngle) * speed, y: Math.sin(state.aimAngle) * speed };
+}
+
+// Power used purely to draw the aim guide: when no strength is chosen yet
+// (slider at 0) it previews at a standard pace so the line stays visible.
+function effectivePower() { return state.power < POWER_MIN ? PREVIEW_POWER : state.power; }
+function previewVelocity() {
+  const speed = effectivePower() * MAX_SPEED;
   return { x: Math.cos(state.aimAngle) * speed, y: Math.sin(state.aimAngle) * speed };
 }
 
@@ -1016,7 +1034,7 @@ function updateAfterNote() {
 
 function ensurePrediction() {
   if (state.predDirty) {
-    state.pred = simulateShot(balls, bounds, shotVelocity());
+    state.pred = simulateShot(balls, bounds, previewVelocity());
     state.predDirty = false;
     currentShotTips();
     scheduleOutcomes();
@@ -1261,6 +1279,7 @@ function frame() {
     stepPhysics(balls, bounds);
     pocketBalls();
   } else if (wasMoving) {
+    state.power = 0;          // each new shot starts with no power chosen
     state.predDirty = true;
     resolveTurn();
     scheduleAdvisor();
@@ -1276,31 +1295,34 @@ function frame() {
 function activeObjectCount() { return balls.filter((b) => b.active && b.number !== 0).length; }
 function isBreak() { return game.open && activeObjectCount() === 15; }
 
-function breakShot() {
+// Decide the current player's shot without firing it, so the cue can be shown
+// lining up first. Returns { aimAngle, power } or null (nothing to hit).
+function autoPickShot() {
   const cue = balls[0];
-  let apex = null, nd = Infinity;
-  for (const b of balls) {
-    if (!b.active || b.number === 0) continue;
-    const d = Vec.len(Vec.sub(b.pos, cue.pos));
-    if (d < nd) { nd = d; apex = b; }
+  if (isBreak()) {
+    let apex = null, nd = Infinity;
+    for (const b of balls) {
+      if (!b.active || b.number === 0) continue;
+      const d = Vec.len(Vec.sub(b.pos, cue.pos));
+      if (d < nd) { nd = d; apex = b; }
+    }
+    if (apex) return { aimAngle: Math.atan2(apex.pos.y - cue.pos.y, apex.pos.x - cue.pos.x), power: 1 };
   }
-  if (!apex) return;
-  state.aimAngle = Math.atan2(apex.pos.y - cue.pos.y, apex.pos.x - cue.pos.x);
-  state.power = 1;
-  shoot();
-}
+  const group = game.players[game.turn].group;
+  let shot = null;
+  if (group) shot = planRunout(group);
+  else { computeRecommendations(); shot = advisor.list[0] || null; }
+  if (shot) return { aimAngle: shot.aimAngle, power: shot.power };
 
-// No makeable shot: tap the nearest legal ball so the turn passes cleanly
-// (hitting your own group avoids a foul).
-function autoSafety() {
-  const cue = balls[0];
+  // Nothing makeable: softly tap the nearest legal ball to pass the turn
+  // cleanly (hitting your own group avoids a foul).
   const targets = legalTargets();
-  if (!targets.length) { game.turn = 1 - game.turn; updateStatus(); scheduleAutoShot(); return; }
-  let nearest = targets[0], nd = Infinity;
-  for (const t of targets) { const d = Vec.len(Vec.sub(t.pos, cue.pos)); if (d < nd) { nd = d; nearest = t; } }
-  state.aimAngle = Math.atan2(nearest.pos.y - cue.pos.y, nearest.pos.x - cue.pos.x);
-  state.power = 0.4;
-  shoot();
+  if (targets.length) {
+    let nearest = targets[0], nd = Infinity;
+    for (const t of targets) { const d = Vec.len(Vec.sub(t.pos, cue.pos)); if (d < nd) { nd = d; nearest = t; } }
+    return { aimAngle: Math.atan2(nearest.pos.y - cue.pos.y, nearest.pos.x - cue.pos.x), power: 0.45 };
+  }
+  return null;
 }
 
 // --- run-out lookahead -----------------------------------------------------
@@ -1389,30 +1411,27 @@ function planRunout(group) {
   return best ? best.shot : firsts[0];
 }
 
-function autoShoot() {
+// Human-paced turn: think, line up the cue (showing the aim and filling the
+// power bar), hold a beat, then strike.
+function autoAim() {
   if (!autoplayOn || game.over || !allStopped(balls)) return;
-  if (isBreak()) { breakShot(); return; }
-  const group = game.players[game.turn].group;
-  let shot;
-  if (group) {
-    shot = planRunout(group);
-  } else {
-    computeRecommendations();
-    shot = advisor.list[0] || null;
-  }
-  if (shot) {
-    state.aimAngle = shot.aimAngle;
-    state.power = shot.power;
-    state.predDirty = true;
-    shoot();
-  } else {
-    autoSafety();
-  }
+  const plan = autoPickShot();
+  if (!plan) { game.turn = 1 - game.turn; updateStatus(); scheduleAutoShot(); return; }
+  state.aimAngle = plan.aimAngle;
+  state.power = plan.power;     // the bar visibly fills to the chosen strength
+  state.predDirty = true;
+  if (autoTimer) clearTimeout(autoTimer);
+  autoTimer = setTimeout(autoStrike, AUTO_STRIKE);
+}
+
+function autoStrike() {
+  if (!autoplayOn || game.over || !allStopped(balls)) return;
+  shoot();
 }
 
 function scheduleAutoShot() {
   if (autoTimer) clearTimeout(autoTimer);
-  autoTimer = setTimeout(autoShoot, 700); // brief pause so the aim is visible
+  autoTimer = setTimeout(autoAim, AUTO_THINK);
 }
 
 function setAutoplay(on) {
@@ -1469,13 +1488,14 @@ canvas.addEventListener("pointermove", (e) => {
 });
 
 window.addEventListener("pointerup", () => {
-  if (state.drag === "power") shoot();
+  // Release the slider above 0 to strike; release at 0 to cancel the shot.
+  if (state.drag === "power" && state.power >= POWER_MIN) shoot();
   state.drag = null;
 });
 
 window.addEventListener("keydown", (e) => {
   if (e.key === "r" || e.key === "R") newRack();
-  else if (e.code === "Space") { e.preventDefault(); if (allStopped(balls)) shoot(); }
+  else if (e.code === "Space") { e.preventDefault(); if (allStopped(balls) && state.power >= POWER_MIN) shoot(); }
 });
 
 ui.reset.addEventListener("click", newRack);
