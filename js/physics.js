@@ -53,11 +53,10 @@ function pocketCenters() {
 }
 
 class Ball {
-  constructor(x, y, color, label) {
+  constructor(x, y, number) {
     this.pos = { x, y };
     this.vel = { x: 0, y: 0 };
-    this.color = color;
-    this.label = label;     // shown on the ball; "" for the cue ball
+    this.number = number;   // 0 = cue ball; 1-15 object balls
     this.active = true;
   }
 }
