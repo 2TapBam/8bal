@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trajectory Pool — Physics & Aim Simulator</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <main>
+    <h1>Trajectory Pool</h1>
+    <p class="subtitle">A standalone billiards physics sandbox: elastic collisions, cushion bounces, and ghost-ball aim prediction.</p>
+
+    <canvas id="table" width="900" height="500"></canvas>
+
+    <div class="hud">
+      <div class="instructions">
+        <strong>Aim:</strong> move the mouse to point the cue ball.
+        <strong>Shoot:</strong> press and hold to charge power, release to strike.
+        <strong>Reset:</strong> press <kbd>R</kbd> or the button.
+      </div>
+      <div class="controls">
+        <label><input type="checkbox" id="showGuides" checked /> Aim guides</label>
+        <label><input type="checkbox" id="showBounce" checked /> Cushion bounces</label>
+        <button id="reset">Re-rack</button>
+      </div>
+    </div>
+  </main>
+
+  <script src="js/physics.js"></script>
+  <script src="js/aim.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>
