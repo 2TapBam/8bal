@@ -36,6 +36,10 @@ const ui = {
   reset: document.getElementById("reset"),
 };
 const statusEl = document.getElementById("status");
+const shotListEl = document.getElementById("shotList");
+const shotTipsEl = document.getElementById("shotTips");
+const POCKET_NAMES = ["top-left", "top-middle", "top-right", "bottom-left", "bottom-middle", "bottom-right"];
+const advisor = { list: [] };
 
 let balls = [];
 let wasMoving = false;
@@ -176,6 +180,205 @@ function newRack() {
   game.lost = false;
   state.predDirty = true;
   updateStatus();
+  scheduleAdvisor();
+}
+
+// --- shot advisor ----------------------------------------------------------
+
+function legalTargets() {
+  if (game.won || game.lost) return [];
+  let nums;
+  if (!game.group) nums = [1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15];
+  else if (remainingInGroup(game.group) > 0)
+    nums = game.group === "solids" ? [1, 2, 3, 4, 5, 6, 7] : [9, 10, 11, 12, 13, 14, 15];
+  else nums = [8];
+  return balls.filter((b) => b.active && nums.includes(b.number));
+}
+
+function isLegalNumber(n) {
+  if (game.won || game.lost) return false;
+  if (!game.group) return n >= 1 && n <= 15 && n !== 8;
+  if (remainingInGroup(game.group) > 0)
+    return game.group === "solids" ? n >= 1 && n <= 7 : n >= 9 && n <= 15;
+  return n === 8;
+}
+
+function angDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return d;
+}
+
+// Is the straight corridor from `from` to `to` blocked by another ball?
+function pathBlocked(from, to, ignore) {
+  const seg = Vec.sub(to, from);
+  const segLen = Vec.len(seg);
+  if (segLen < 1e-6) return false;
+  const dir = Vec.scale(seg, 1 / segLen);
+  for (const b of balls) {
+    if (!b.active || ignore.includes(b.number)) continue;
+    const t = Vec.dot(Vec.sub(b.pos, from), dir);
+    if (t < -TABLE.ballRadius || t > segLen + TABLE.ballRadius) continue;
+    const clampT = Math.max(0, Math.min(segLen, t));
+    const closest = Vec.add(from, Vec.scale(dir, clampT));
+    if (Vec.len(Vec.sub(b.pos, closest)) < 2 * TABLE.ballRadius - 1) return true;
+  }
+  return false;
+}
+
+// Geometry of potting `target` into pocket `pi`: aim, cut angle and distance,
+// or null if the cut is impossible or the path is blocked.
+function evaluateCandidate(target, pi) {
+  const cue = balls[0];
+  const P = pocketCenters()[pi];
+  const T = target.pos;
+  const dirTP = Vec.norm(Vec.sub(P, T));
+  const ghost = Vec.sub(T, Vec.scale(dirTP, 2 * TABLE.ballRadius));
+  const toGhost = Vec.sub(ghost, cue.pos);
+  const distCue = Vec.len(toGhost);
+  if (distCue < 1) return null;
+  const aimDir = Vec.scale(toGhost, 1 / distCue);
+  const dot = Vec.dot(aimDir, dirTP);
+  if (dot < 0.21) return null; // cut thinner than ~78 degrees is unrealistic
+  if (pathBlocked(cue.pos, ghost, [0, target.number])) return null;
+  if (pathBlocked(T, P, [0, target.number])) return null;
+  return {
+    number: target.number,
+    pocketIndex: pi,
+    aimAngle: Math.atan2(aimDir.y, aimDir.x),
+    cutDeg: Math.acos(Math.max(-1, Math.min(1, dot))) * 180 / Math.PI,
+    dist: distCue + Vec.len(Vec.sub(P, T)),
+  };
+}
+
+// Confirm a candidate by simulating it; keep the lowest-difficulty power that
+// actually drops the ball into the intended pocket.
+function validateAndScore(c) {
+  const diag = Math.hypot(W, H);
+  let best = null;
+  for (const p of [0.5, 0.8]) {
+    const speed = p * MAX_SPEED;
+    const vel = { x: Math.cos(c.aimAngle) * speed, y: Math.sin(c.aimAngle) * speed };
+    const trails = simulateShot(balls, bounds, vel, 700);
+    const tt = trails.find((t) => t.number === c.number);
+    const cueT = trails.find((t) => t.number === 0);
+    const intoPocket = tt && tt.pocketed &&
+      Vec.len(Vec.sub(tt.rest, pocketCenters()[c.pocketIndex])) < TABLE.pocketRadius + 3;
+    if (!intoPocket) continue;
+    const scratch = !!(cueT && cueT.pocketed);
+    const difficulty = (c.cutDeg / 90) * 55 + (c.dist / diag) * 35 + (scratch ? 40 : 0) + p * 8;
+    if (!best || difficulty < best.difficulty) {
+      best = { ...c, power: p, scratch, difficulty, quality: Math.max(5, Math.round(100 - difficulty)) };
+    }
+  }
+  return best;
+}
+
+function computeRecommendations() {
+  if (!allStopped(balls)) return;
+  const out = [];
+  for (const t of legalTargets()) {
+    const cands = [];
+    for (let pi = 0; pi < 6; pi++) {
+      const c = evaluateCandidate(t, pi);
+      if (c) cands.push(c);
+    }
+    cands.sort((a, b) => (a.cutDeg + a.dist * 0.05) - (b.cutDeg + b.dist * 0.05));
+    let bestForBall = null;
+    for (const c of cands.slice(0, 2)) {
+      const s = validateAndScore(c);
+      if (s && (!bestForBall || s.difficulty < bestForBall.difficulty)) bestForBall = s;
+    }
+    if (bestForBall) out.push(bestForBall);
+  }
+  out.sort((a, b) => a.difficulty - b.difficulty);
+  advisor.list = out.slice(0, 5);
+  renderShotList();
+}
+
+// Run the (heavier) analysis off the critical path so the frame still paints.
+function scheduleAdvisor() {
+  setTimeout(computeRecommendations, 0);
+}
+
+function renderShotList() {
+  if (!shotListEl) return;
+  if (game.won || game.lost) { shotListEl.innerHTML = "<li>Game over &mdash; press R to rack again.</li>"; return; }
+  if (!advisor.list.length) { shotListEl.innerHTML = "<li>No clear pot &mdash; play safe or break up a cluster.</li>"; return; }
+  shotListEl.innerHTML = advisor.list.map((s) => {
+    const diff = s.cutDeg < 8 ? "straight in" : s.cutDeg < 25 ? "easy cut" : s.cutDeg < 45 ? "moderate cut" : "thin cut";
+    const warn = s.scratch ? " &middot; scratch risk" : "";
+    return `<li><b>${s.number}-ball</b> &rarr; ${POCKET_NAMES[s.pocketIndex]} <span class="meta">${diff}${warn} &middot; ${s.quality}%</span></li>`;
+  }).join("");
+}
+
+function renderTips(tips) {
+  if (!shotTipsEl) return;
+  shotTipsEl.innerHTML = tips.length
+    ? tips.map((t) => `<li>${t}</li>`).join("")
+    : "<li>Aim to see feedback on your shot.</li>";
+}
+
+// Feedback on the line the player is currently aiming, read from the cached
+// full-shot prediction plus the ranked recommendations.
+function currentShotTips() {
+  if (!shotTipsEl) return;
+  if (game.won || game.lost) { renderTips(["Game over — press R to rack again."]); return; }
+  const pred = state.pred;
+  if (!pred) { renderTips([]); return; }
+
+  const tips = [];
+  const cueT = pred.find((t) => t.number === 0);
+  const scratch = !!(cueT && cueT.pocketed);
+  const potted = pred.filter((t) => t.pocketed && t.number !== 0);
+  const good = potted.filter((t) => isLegalNumber(t.number)).map((t) => t.number);
+  const bad8 = potted.some((t) => t.number === 8) && !isLegalNumber(8);
+
+  if (scratch) tips.push("This line scratches the cue ball — lower the power or change the angle.");
+  if (bad8) tips.push("This pots the 8-ball early, which loses the game.");
+  if (good.length) tips.push(`Good — this pots the ${good.join(", ")}.`);
+
+  if (advisor.list.length) {
+    let nearest = null, nd = Infinity;
+    for (const s of advisor.list) {
+      const d = angDiff(s.aimAngle, state.aimAngle);
+      if (Math.abs(d) < nd) { nd = Math.abs(d); nearest = { s, d }; }
+    }
+    const degs = nearest.d * 180 / Math.PI;
+    if (Math.abs(degs) > 1.2) {
+      tips.push(`Rotate about ${Math.abs(degs).toFixed(1)}° ${degs > 0 ? "clockwise" : "counter-clockwise"} to line up the ${nearest.s.number}-ball (${POCKET_NAMES[nearest.s.pocketIndex]}).`);
+    } else {
+      if (!good.length && !scratch) tips.push(`Lined up on the ${nearest.s.number}-ball — fine-tune with the right dial.`);
+      const pd = state.power - nearest.s.power;
+      if (pd > 0.12) tips.push("Ease off the power for better cue control.");
+      else if (pd < -0.12) tips.push("Add a touch more power so it reaches.");
+    }
+  }
+
+  if (!tips.length) tips.push("No legal pot on this line — try a different angle.");
+  renderTips(tips.slice(0, 3));
+}
+
+function drawAdvisorBadges() {
+  advisor.list.forEach((s, i) => {
+    const b = balls.find((x) => x.active && x.number === s.number);
+    if (!b) return;
+    const bx = b.pos.x;
+    const by = b.pos.y - TABLE.ballRadius - 9;
+    ctx.beginPath();
+    ctx.arc(bx, by, 8, 0, Math.PI * 2);
+    ctx.fillStyle = i === 0 ? "rgba(243,196,61,0.95)" : "rgba(16,24,30,0.9)";
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = "rgba(255,255,255,0.85)";
+    ctx.stroke();
+    ctx.fillStyle = i === 0 ? "#1a1a1a" : "#fff";
+    ctx.font = "bold 10px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(i + 1), bx, by + 0.5);
+  });
 }
 
 // --- control geometry ------------------------------------------------------
@@ -332,6 +535,7 @@ function ensurePrediction() {
   if (state.predDirty) {
     state.pred = simulateShot(balls, bounds, shotVelocity());
     state.predDirty = false;
+    currentShotTips();
   }
 }
 
@@ -460,6 +664,7 @@ function render() {
   }
   for (const b of balls) if (b.active) drawBall(b);
   if (!moving && ui.showGuides.checked) {
+    drawAdvisorBadges();
     drawCueStick();
     drawPowerMeter();
     drawFineDial();
@@ -474,6 +679,7 @@ function frame() {
   } else if (wasMoving) {
     state.predDirty = true; // table just settled — recompute for the new turn
     evaluateShot();
+    scheduleAdvisor();
   }
   wasMoving = moving;
   render();
